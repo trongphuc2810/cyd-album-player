@@ -1,0 +1,14 @@
+build/
+*.bin
+*.elf
+*.map
+*.nbin
+flash-package/
+tools/esp-flasher/firmware/
+__pycache__/
+*.pyc
+mockup_*.png
+cylp1_*.png
+render_stl*.py
+stl_*.py
+*.stl

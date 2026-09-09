@@ -1,0 +1,279 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESP32 Flasher</title>
+<style>
+  :root{
+    --bg:#0a0e14; --panel:#11161f; --panel2:#151b27; --border:#1f2836;
+    --text:#e6edf6; --muted:#8b98ab; --accent:#3d8bff; --accent2:#22c55e;
+    --danger:#ef4444; --warn:#f59e0b;
+  }
+  *{box-sizing:border-box; margin:0; padding:0}
+  body{background:var(--bg); color:var(--text); font-family:'Segoe UI',system-ui,sans-serif; min-height:100vh; display:flex; flex-direction:column; align-items:center; padding:32px 16px}
+  .wrap{width:100%; max-width:640px}
+  header{display:flex; align-items:center; gap:14px; margin-bottom:24px}
+  .logo{width:46px;height:46px;border-radius:12px;background:linear-gradient(135deg,var(--accent),#7c5cff);display:grid;place-items:center;font-size:22px;font-weight:800;color:#fff;box-shadow:0 6px 20px rgba(61,139,255,.35)}
+  h1{font-size:20px;font-weight:700}
+  .sub{color:var(--muted);font-size:13px;margin-top:2px}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:16px}
+  .card h2{font-size:14px;font-weight:700;margin-bottom:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+  .label{font-size:12px;color:var(--muted);margin:12px 0 6px;font-weight:600}
+  .row{display:flex;gap:10px;flex-wrap:wrap}
+  .field{background:var(--panel2);border:1px solid var(--border);border-radius:9px;padding:10px 12px;color:var(--text);font-size:13px;flex:1;min-width:120px}
+  select.field{cursor:pointer}
+  input[type=file]{display:none}
+  .btn{border:none;border-radius:9px;padding:11px 16px;font-size:13px;font-weight:700;cursor:pointer;transition:filter .15s,transform .05s;flex:1;min-width:130px;color:#fff;background:#26334a;display:inline-flex;align-items:center;justify-content:center;gap:8px}
+  .btn:hover{filter:brightness(1.15)}
+  .btn:active{transform:scale(.98)}
+  .btn:disabled{opacity:.45;cursor:not-allowed;filter:none}
+  .btn.primary{background:var(--accent);box-shadow:0 4px 14px rgba(61,139,255,.3)}
+  .btn.success{background:var(--accent2);box-shadow:0 4px 14px rgba(34,197,94,.3)}
+  .btn.danger{background:var(--danger)}
+  .filebtn{background:var(--panel2);border:1px dashed var(--border)}
+  #fileName{font-size:12px;color:var(--accent);margin-top:8px;word-break:break-all}
+  .console{background:#060910;border:1px solid var(--border);border-radius:10px;height:260px;overflow-y:auto;padding:12px;font-family:'Consolas','Menlo',monospace;font-size:12px;line-height:1.6;white-space:pre-wrap}
+  .console .info{color:var(--accent)} .console .ok{color:var(--accent2)} .console .warn{color:var(--warn)} .console .err{color:var(--danger)} .console .dim{color:#566176}
+  .status{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:600;margin-bottom:10px}
+  .dot{width:9px;height:9px;border-radius:50%;background:#3b4656}
+  .dot.on{background:var(--accent2);box-shadow:0 0 8px var(--accent2)} .dot.busy{background:var(--warn);animation:blink 1s infinite}
+  @keyframes blink{50%{opacity:.3}}
+  .progress{height:8px;background:var(--panel2);border-radius:6px;overflow:hidden;margin-top:12px;display:none}
+  .progress-fill{height:100%;width:0%;background:linear-gradient(90deg,var(--accent),#7c5cff);transition:width .15s}
+  .hint{font-size:11px;color:var(--muted);margin-top:12px;line-height:1.7}
+  .firm{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  a{color:var(--accent);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">&#x1F60E;</div>
+    <div><h1>ESP32 Web Flasher</h1><div class="sub">Flash firmware qua USB · không cần ESPHome/HA</div></div>
+  </header>
+
+  <!-- 1b. FIRMWARE SERVER LIST -->
+  <div class="card" id="fwCard" style="display:none">
+    <h2>&#128187; · Firmware mới nhất (server)</h2>
+    <div class="firm" id="fwList"><span class="dim">Đang nạp list...</span></div>
+    <div class="hint">Nhấn tên firmware để nạp trực vào thiết bị (4 phần tự à đúng offset).</div>
+  </div>
+
+  <!-- 1. FILE -->
+  <div class="card">
+    <h2>&#128190; 1 · Chọn firmware (.bin)</h2>
+    <input type="file" id="fileInput" accept=".bin,application/octet-stream">
+    <button class="btn filebtn" id="fileBtn">&#128196; Chọn file .bin</button>
+    <div id="fileName" style="display:none"></div>
+  </div>
+
+  <!-- 2. KẾT NỐI -->
+  <div class="card">
+    <h2>&#128225; 2 · Kết nối thiết bị</h2>
+    <div class="status"><span class="dot" id="dot"></span><span id="statusText">Chưa kết nối</span></div>
+    <div class="row">
+      <button class="btn primary" id="connectBtn">&#128279; Connect (chọn COM)</button>
+      <button class="btn danger" id="disconnectBtn" disabled>&#128683; Ngắt</button>
+    </div>
+    <div class="label">Cài đặt kết nối</div>
+    <div class="row">
+      <select class="field" id="baud">
+        <option value="115200">115200</option>
+        <option value="230400">230400</option>
+        <option value="460800" selected>460800</option>
+        <option value="921600">921600</option>
+      </select>
+      <select class="field" id="chip">
+        <option value="auto">Tự nhận chip</option>
+        <option value="esp32">ESP32 (CYD)</option>
+        <option value="esp32s3">ESP32-S3</option>
+        <option value="esp32c3">ESP32-C3</option>
+        <option value="esp32s2">ESP32-S2</option>
+        <option value="esp8266">ESP8266</option>
+      </select>
+    </div>
+  </div>
+
+  <!-- 3. THAO TÁC -->
+  <div class="card">
+    <h2>&#9889; 3 · Flash / Erase</h2>
+    <div class="row">
+      <button class="btn success" id="flashBtn" disabled>&#11015; Flash firmware</button>
+      <button class="btn danger" id="eraseBtn" disabled>&#128465;&#65039; Erase Flash</button>
+    </div>
+    <div class="progress" id="progress"><div class="progress-fill" id="progressFill"></div></div>
+    <div class="label">&#128172; Console</div>
+    <div class="console" id="console"></div>
+    <div class="hint">
+      &#128161; <b>Quan trọng:</b> Dùng Chrome/Edge trên máy tính, mở web qua <b>localhost</b>, cắm CYD vào cổng USB.
+      Nếu lỗi "chiếm port", rút USB cắm lại. OTA không dùng được khi thiết bị crash-loop — flash qua USB là cách cứu.
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { ESPLoader } from './vendor/esptool-js.bundle.js';
+(() => {
+  const $ = id => document.getElementById(id);
+  const console_ = $('console'), fileBtn=$('fileBtn'), fileInput=$('fileInput'),
+        fileName=$('fileName'), connectBtn=$('connectBtn'), disconnectBtn=$('disconnectBtn'),
+        flashBtn=$('flashBtn'), eraseBtn=$('eraseBtn'), dot=$('dot'), statusText=$('statusText'),
+        baudSel=$('baud'), chipSel=$('chip'), progress=$('progress'), progressFill=$('progressFill');
+
+  let port = null, loader = null, chip = 'esp32', fileBytes = null;
+  let fwData = null; // firmware chọn từ server {name, manifest}
+
+  async function loadFirmwareList(){
+    try{
+      const r = await fetch('/api/firmware', {cache:'no-store'});
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      const j = await r.json();
+      const list = j.firmwares || [];
+      const el = $('fwList');
+      if(!list.length){ el.innerHTML = '<span class="dim">Chưa có firmware trên server</span>'; $('fwCard').style.display='block'; return; }
+      $('fwCard').style.display='block';
+      el.innerHTML='';
+      list.forEach(fw=>{
+        const b=document.createElement('button');
+        b.className='btn filebtn';
+        b.style.flex='0 1 auto';
+        const m=fw.manifest;
+        const total=m? m.files.reduce((s,x)=>s+x.size,0) : 0;
+        b.innerHTML = `<div style="text-align:left"><div style="font-weight:700">${fw.name}</div><div style="font-size:11px;color:var(--muted)">${m? m.version+' · '+(total/1024).toFixed(0)+' KB' : 'không có manifest'}</div></div>`;
+        b.onclick=()=>{
+          if(!m){ log('Firmware này thiếu manifest.json','err'); return; }
+          fwData = fw; fileBytes=null;
+          document.querySelectorAll('#fwList .btn').forEach(x=>x.style.borderColor='var(--border)');
+          b.style.borderColor='var(--accent2)';
+          log(`Đã chọn firmware: ${fw.name} (${m.version}) — ${m.files.length} vùng flash`,'ok');
+          if(port) flashBtn.disabled=false;
+        };
+        el.appendChild(b);
+      });
+    }catch(e){
+      log('Không thấy /api/firmware: '+e.message,'warn');
+    }
+  }
+  loadFirmwareList();
+  setInterval(loadFirmwareList, 15000); // tự refresh khi em build firmware mới
+
+  function log(msg, cls='') {
+    const d=document.createElement('div');
+    if(cls) d.className=cls;
+    d.textContent='> '+msg;
+    console_.appendChild(d); console_.scrollTop=console_.scrollHeight;
+  }
+
+  function setStatus(txt, cls) {
+    statusText.textContent=txt;
+    dot.className='dot'+(cls==='ok'?' on':cls==='busy'?' busy':'');
+  }
+
+  // Terminal adapter → console
+  const terminal = {
+    raw:false,
+    clean:true,
+    echoLine:true,
+    write(data){ log(data.replace(/\n+$/,''), ''); },
+    writeln(data){ log(data.replace(/\n+$/,'')); },
+    writeRaw(data){ log('RAW:'+data); },
+    cleanLine(){},
+    show(){},
+    hide(){},
+  };
+
+  fileBtn.onclick=()=>fileInput.click();
+  fileInput.onchange=e=>{
+    const f=e.target.files[0];
+    if(!f) return;
+    fileName.style.display='block';
+    fileName.textContent='✓ '+f.name+' ('+(f.size/1024).toFixed(1)+' KB)';
+    f.arrayBuffer().then(b=>{ fileBytes=new Uint8Array(b); log('Đã nạp '+f.name+' - '+fileBytes.length+' bytes','ok'); });
+  };
+
+  async function activePort(){
+    if(!port) throw new Error('Chưa kết nối thiết bị');
+    return port;
+  }
+
+  connectBtn.onclick=async ()=>{
+    try{
+      if(!navigator.serial){ log('Trình duyệt không hỗ trợ WebSerial. Dùng Chrome/Edge.', 'err'); return; }
+      port = await navigator.serial.requestPort();
+      setStatus('Đang kết nối...','busy');
+      await port.open({baudRate:parseInt(baudSel.value,10)});
+      chip = chipSel.value;
+      setStatus('Đã kết nối ✓','ok');
+      log('Kết nối cổng thành công. Baud '+baudSel.value,'ok');
+      log('Nhận diện chip qua esptool...','info');
+      loader = new ESPLoader(port, {baudrate:parseInt(baudSel.value,10), terminal});
+      await loader.main();
+      const chipInfo = loader.chip;
+      if(chip!=='auto'){
+        // force chọn
+        log(`Đặt chip ${chip}`,'warn');
+      }
+      log('Chip: '+loader.chip+ (loader.chipDescription?' - '+loader.chipDescription:''),'ok');
+      connectBtn.disabled=true; disconnectBtn.disabled=false; flashBtn.disabled=!fileBytes; eraseBtn.disabled=false;
+    }catch(e){ log('Lỗi kết nối: '+e.message,'err'); setStatus('Lỗi',''); }
+  };
+
+  disconnectBtn.onclick=async ()=>{
+    try{ if(loader) await loader.disconnect(); if(port) await port.close(); }catch(e){}
+    port=null;loader=null; setStatus('Đã ngắt',''); connectBtn.disabled=false; disconnectBtn.disabled=true; flashBtn.disabled=true; eraseBtn.disabled=true;
+    log('Đã ngắt kết nối.','info');
+  };
+
+  function setProgress(p){
+    progress.style.display='block'; progressFill.style.width=p+'%';
+    if(p>=100){ setTimeout(()=>{progress.style.display='none'; progressFill.style.width=0;},800); }
+  }
+
+  flashBtn.onclick=async ()=>{
+    if(!port){ log('Connect thiết bị trước.','err'); return; }
+    if(!fileBytes && !fwData){ log('Chọn firmware (server) hoặc file .bin trước.','err'); return; }
+    flashBtn.disabled=true; eraseBtn.disabled=true; setStatus('Đang flash...','busy');
+    try{
+      let fileArray;
+      if(fwData){
+        const m = fwData.manifest;
+        log(`Flash ${fwData.name} — tải ${m.files.length} vùng từ server...`,'info');
+        fileArray = [];
+        for(const part of m.files){
+          const url = '/firmware/'+encodeURIComponent(fwData.name)+'/'+encodeURIComponent(part.file);
+          const rr = await fetch(url, {cache:'no-store'});
+          if(!rr.ok) throw new Error('Tải '+part.file+' fail HTTP '+rr.status);
+          const buf = new Uint8Array(await rr.arrayBuffer());
+          fileArray.push({data: buf, address: part.address});
+          log(`  ✓ ${part.file} @ 0x${part.address.toString(16)} (${buf.length} B)`,'dim');
+        }
+      } else {
+        fileArray = [{data: fileBytes, address: 0x0}];
+        log('Bắt đầu flash '+fileBytes.length+' bytes (merged @0x0)...','info');
+      }
+      await loader.writeFlash({
+        fileArray,
+        flashSize:'keep',
+        flashMode:'keep',
+        flashFreq:'keep',
+      });
+      log('Flash xong! Rút USB hoặc nhấn RESET để khởi động firmware mới.','ok');
+      setStatus('Flash hoàn tất ✓','ok'); setProgress(100);
+    }catch(e){ log('Lỗi flash: '+e.message,'err'); setStatus('Lỗi flash',''); }
+    finally{ flashBtn.disabled=false; eraseBtn.disabled=false; }
+  };
+
+  eraseBtn.onclick=async ()=>{
+    if(!port){ log('Connect thiết bị trước.','err'); return; }
+    eraseBtn.disabled=true; flashBtn.disabled=true; setStatus('Đang xóa...','busy');
+    try{
+      await loader.eraseFlash();
+      log('Đã xóa toàn bộ flash.','ok'); setStatus('Erase hoàn tất ✓','ok'); setProgress(100);
+    }catch(e){ log('Lỗi erase: '+e.message,'err'); setStatus('Lỗi erase',''); }
+    finally{ eraseBtn.disabled=false; flashBtn.disabled=!fileBytes; }
+  };
+})();
+</script>
+</body>
+</html>
