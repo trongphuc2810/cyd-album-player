@@ -38,6 +38,15 @@ Hai chế độ **tách hoàn toàn**: chuyển mode = máy tự khởi động 
 - Nút **`< SD`** (góc phải trên) → lưu cờ + reset về SD mode
 - Audio PCM đổ ra **task I2S riêng pinned core 0** + ring buffer 8192 frame → không drop, không giật
 
+### Jingle (âm báo) — boot / kết nối / ngắt kết nối
+- 4 thời điểm có âm: **boot SD mode**, **boot BT mode**, **phone kết nối**, **phone ngắt kết nối**
+- Mức âm **cố định 20%**, độc lập với volume đang lưu (SD boot mặc định 10% vẫn nghe rõ); không đổi gain thật của máy
+- Nguồn âm theo thứ tự ưu tiên:
+  1. Thẻ SD: `/sounds/boot.wav`, `/sounds/connect.wav`, `/sounds/disconnect.wav` — WAV PCM 8/16-bit, mono hoặc stereo, tần số bất kỳ ≤ 96 kHz, tối đa 6 giây (tự resample về 44.1 kHz). Có file trên thẻ thì firmware dùng file → đổi tiếng **không cần nạp lại**
+  2. **PCM nhúng sẵn trong flash** (`cyd-album-v2/jingles_pcm.h`, sinh bằng `tools/make_jingles.py`) — bản build hiện tại đã nhúng 3 tiếng của anh, nên **không cần thẻ SD vẫn có âm báo**
+  3. Không có cả hai → chime chuông sin dựng sẵn trong code
+- An toàn: callback Bluetooth chỉ **set cờ**, âm thanh do task I2S core 0 phát (không gọi I2S trong callback → tránh watchdog); sau mỗi jingle, buffer nhạc từ điện thoại bị xoá để không phát lại đoạn cũ
+
 ### Kiến trúc chống crash (board không PSRAM)
 - BT stack **chỉ start đúng một lần đời boot** — không `end()`/restart runtime (restart sink là nguyên nhân crash khi phone kết nối)
 - Callback A2DP **không đụng I2S/LCD**: chỉ ghi PCM vào ring, mọi thao tác TFT chạy trên main loop
@@ -143,6 +152,8 @@ arduino-cli compile --fqbn esp32:esp32:esp32:PartitionScheme=huge_app cyd-album-
 ## Sử dụng
 
 **Thẻ nhạc:** chép vào `SD:/music/<tên-album>/baihat.mp3` (hỗ trợ `.mp3`, `.wav`).
+
+**Thẻ âm báo (tuỳ chọn):** `SD:/sounds/boot.wav`, `SD:/sounds/connect.wav`, `SD:/sounds/disconnect.wav` — có thì firmware dùng file, không có thì dùng chime dựng sẵn.
 
 **Thứ tự boot (SD mode):** loading → thử WiFi & đồng bộ giờ (tự tắt radio) → **đồng hồ chờ** → chạm để vào **Albums**.
 

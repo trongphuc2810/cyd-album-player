@@ -24,6 +24,17 @@
 #define A2DP_SPP_SUPPORT 0        // free ~20-40KB: no serial-port-profile needed
 #include <BluetoothA2DPSink.h>
 #include <esp_avrc_api.h>
+// Chimes embedded in flash (~752 KB of PCM). Build with
+// -DJINGLE_NO_EMBED for a ~750 KB smaller image: the /sounds/*.wav files on
+// the SD card then become the only source of the custom chimes (BT mode,
+// which never mounts the card, falls back to the built-in synth chime).
+#ifdef JINGLE_NO_EMBED
+  #define JINGLE_EMB_RATE 44100
+  static const uint32_t JINGLE_EMB_LEN[3] = {0, 0, 0};
+  static const int16_t* const JINGLE_EMB_PTR[3] = {nullptr, nullptr, nullptr};
+#else
+  #include "jingles_pcm.h"
+#endif
 
 // ── Hardware pins ───────────────────────────────────────────
 #define SD_CS      5
@@ -48,6 +59,7 @@ XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 Preferences prefs;
 #define NS_CFG "cyd2"          // display invert / brightness / wifi
 #define BT_DEVICE_NAME "CYD-32-BP"
+#define JINGLE_GAIN 0.20f      // boot/connect/disconnect chimes: fixed 20%, own gain
 
 // Small subclass that exposes the protected AVRCP volume-notify call so the
 // ESP volume buttons can move the phone's volume too (two-way sync).
@@ -200,10 +212,11 @@ public:
   float gainNow = 0.0f;    // actual applied gain (fade target = vol)
   bool fading = false;
   bool mutePending = false;
+  bool jingleMode = false;  // true while a boot/connect chime plays (fixed gain)
 
   bool ConsumeSample(int16_t sample[2]) override {
-    // fade toward target
-    if (fading) {
+    // fade toward target (a chime ignores the fade: it has its own gain)
+    if (fading && !jingleMode) {
       float target = mutePending ? 0.0f : vol;
       gainNow += (target - gainNow) * 0.25f;
       if (fabsf(target - gainNow) < 0.002f) {
@@ -212,7 +225,8 @@ public:
       }
     }
     // mono mix (MAX98357A is a mono amp; send same mix to both I2S channels)
-    int32_t m = (int32_t)(((int32_t)sample[0] + (int32_t)sample[1]) * gainNow * 0.5f);
+    float g = jingleMode ? JINGLE_GAIN : gainNow;
+    int32_t m = (int32_t)(((int32_t)sample[0] + (int32_t)sample[1]) * g * 0.5f);
     if (m >  32767) m =  32767;
     if (m < -32768) m = -32768;
     int16_t mono = (int16_t)m;
@@ -1542,6 +1556,259 @@ static volatile uint32_t btDropped = 0;
 static volatile uint32_t btTotal = 0;
 static int16_t btChunk[1024 * 2];    // audio task transfers in big chunks
 
+// ═══════════════════════════════════════════════════════════
+// Jingles — boot / phone-connect / phone-disconnect chimes
+//  * Source: /sounds/<name>.wav on the SD card when present,
+//    otherwise a built-in procedural chime (works with no files).
+//  * Played at a FIXED 20% gain, independent of the saved volume
+//    (SD mode boots at 10% and the chime must still be audible).
+//  * SD mode: blocking playback from setup().
+//  * BT mode: queued (jingleReq) and played by the core-0 audio
+//    task — no I2S call ever runs inside a Bluedroid callback
+//    (that trips the task watchdog on this no-PSRAM board).
+// ═══════════════════════════════════════════════════════════
+#define JINGLE_RATE   44100
+#define JINGLE_MS_MAX 6000        // never hold the phone stream off longer
+
+enum { JINGLE_BOOT = 0, JINGLE_CONN = 1, JINGLE_DISC = 2 };
+static const char* const JINGLE_WAV[3] = {
+  "/sounds/boot.wav", "/sounds/connect.wav", "/sounds/disconnect.wav"
+};
+
+// Built-in fallback chimes: {freq Hz, start ms, dur ms, amp %}
+struct JNote { uint16_t f, startMs, durMs, amp; };
+static const JNote J_BOOT[] = {{523,0,1300,50},{659,160,1300,45},{784,320,1400,42},{1047,480,900,12}};
+static const JNote J_CONN[] = {{880,0,600,55},{1175,130,700,50}};
+static const JNote J_DISC[] = {{659,0,600,45},{440,150,800,40}};
+static const JNote* const J_NOTES[3] = {J_BOOT, J_CONN, J_DISC};
+static const uint8_t  J_NCOUNT[3]    = {4, 2, 2};
+static const uint16_t J_TOTAL_MS[3]  = {1700, 900, 1000};
+
+static int16_t jSin[1024];
+static void jingleInit() {
+  for (int i = 0; i < 1024; i++) jSin[i] = (int16_t)(sinf(2.0f * PI * i / 1024.0f) * 32767.0f);
+}
+static inline float jSine(float turns) {   // turns = phase in whole cycles
+  return jSin[((uint32_t)(turns * 1024.0f)) & 1023] * (1.0f / 32767.0f);
+}
+
+// ── SD wav streaming (PCM 8/16-bit, mono or stereo, any rate) ──
+static File     jWav;
+static bool     jWavIsOpen = false;
+static uint8_t  jBuf[512];
+static uint16_t jBufPos = 0, jBufLen = 0;
+static uint32_t jSrcLeft = 0;        // source frames not yet consumed
+static uint8_t  jFrameBytes = 2;
+static bool     jSrc8 = false, jSrcStereo = false;
+static float    jStep = 1.0f;        // source frames per output frame
+
+// State the source puller needs (declared here: jPullSrc is defined first).
+static int      jCur = 0;
+static bool     jEmbMode = false;      // playing the flash copy instead of an SD file
+static uint32_t jEmbPos = 0;
+
+static bool jPullSrc(float* out) {
+  if (jSrcLeft == 0) return false;
+  if (jEmbMode) {                       // embedded PCM: mono 16-bit @ 44.1 kHz
+    jSrcLeft--;
+    *out = (int16_t)pgm_read_word(&JINGLE_EMB_PTR[jCur][jEmbPos++]) * (1.0f / 32768.0f);
+    return true;
+  }
+  if ((uint32_t)jBufPos + jFrameBytes > jBufLen) {
+    uint16_t want = sizeof(jBuf) - (sizeof(jBuf) % jFrameBytes);
+    int n = jWav.read(jBuf, want);
+    if (n < (int)jFrameBytes) { jSrcLeft = 0; return false; }
+    n -= n % jFrameBytes;
+    jBufLen = (uint16_t)n; jBufPos = 0;
+  }
+  uint8_t* p = &jBuf[jBufPos];
+  jBufPos += jFrameBytes;
+  jSrcLeft--;
+  float l, r;
+  if (jSrc8) {
+    l = ((int)p[0] - 128) * (1.0f / 128.0f);
+    r = jSrcStereo ? (((int)p[1] - 128) * (1.0f / 128.0f)) : l;
+  } else {
+    l = (int16_t)(p[0] | (p[1] << 8)) * (1.0f / 32768.0f);
+    r = jSrcStereo ? ((int16_t)(p[2] | (p[3] << 8)) * (1.0f / 32768.0f)) : l;
+  }
+  *out = (l + r) * 0.5f;
+  return true;
+}
+
+static bool jWavStart(const char* path) {
+  jWav = SD.open(path, FILE_READ);
+  if (!jWav) return false;
+  uint8_t h[12];
+  if (jWav.read(h, 12) != 12 || memcmp(h, "RIFF", 4) || memcmp(h + 8, "WAVE", 4)) {
+    jWav.close(); return false;
+  }
+  uint16_t fmt = 0, ch = 0, bits = 0;
+  uint32_t rate = 0, dataLen = 0;
+  bool haveFmt = false, haveData = false;
+  while (jWav.available() >= 8) {
+    uint8_t ck[8];
+    if (jWav.read(ck, 8) != 8) break;
+    uint32_t sz = (uint32_t)ck[4] | ((uint32_t)ck[5] << 8) |
+                  ((uint32_t)ck[6] << 16) | ((uint32_t)ck[7] << 24);
+    if (!memcmp(ck, "fmt ", 4)) {
+      uint8_t fb[16];
+      if (jWav.read(fb, 16) < 16) break;
+      fmt  = fb[0] | (fb[1] << 8);
+      ch   = fb[2] | (fb[3] << 8);
+      rate = (uint32_t)fb[4] | ((uint32_t)fb[5] << 8) |
+             ((uint32_t)fb[6] << 16) | ((uint32_t)fb[7] << 24);
+      bits = fb[14] | (fb[15] << 8);
+      if (sz > 16) jWav.seek(jWav.position() + (sz - 16));
+      haveFmt = true;
+    } else if (!memcmp(ck, "data", 4)) {
+      dataLen = sz; haveData = true;
+      break;
+    } else {
+      jWav.seek(jWav.position() + sz + (sz & 1u));
+    }
+  }
+  if (!haveFmt || !haveData || (fmt != 1 && fmt != 0xFFFE) ||
+      (bits != 8 && bits != 16) || ch < 1 || ch > 2 || rate == 0 || rate > 96000) {
+    jWav.close(); return false;
+  }
+  uint8_t fbytes = (bits / 8) * ch;
+  uint32_t frames = dataLen / fbytes;
+  uint32_t cap = (uint32_t)JINGLE_MS_MAX * rate / 1000u;
+  if (frames > cap) frames = cap;
+  if (frames == 0) { jWav.close(); return false; }
+  jFrameBytes = fbytes; jSrc8 = (bits == 8); jSrcStereo = (ch == 2);
+  jStep = (float)rate / (float)JINGLE_RATE;
+  jSrcLeft = frames; jBufPos = jBufLen = 0;
+  jWavIsOpen = true;
+  Serial.printf("[JN] wav %s %uHz %uch %ubit %ums\n", path, (unsigned)rate,
+                (unsigned)ch, (unsigned)bits, (unsigned)(frames * 1000u / rate));
+  return true;
+}
+static void jWavStop() { if (jWavIsOpen) { jWav.close(); jWavIsOpen = false; } }
+
+// ── playback state ──
+static uint32_t jOutIdx = 0;
+static float    jOutSample = 0.0f;
+static bool     jUseWav = false, jSrcOk = false;
+static float    jCurSrc = 0.0f, jFrac = 0.0f;
+
+// true only after SD.begin() succeeded (SD mode). BT mode leaves this false so
+// it never touches the card - Bluedroid needs the heap far more than SD does.
+static bool sdReady = false;
+
+// Source priority: /sounds/*.wav on SD (user can swap it any time) ->
+// PCM embedded in flash -> procedural chime.
+static void jingleStart(int idx) {
+  jCur = idx; jOutIdx = 0; jOutSample = 0.0f;
+  jUseWav = false; jSrcOk = false; jFrac = 0.0f;
+  jEmbMode = false; jEmbPos = 0;
+  jWavStop();
+  if (sdReady && SD.cardType() != CARD_NONE && jWavStart(JINGLE_WAV[idx])) {
+    jUseWav = true;
+    jSrcOk = jPullSrc(&jCurSrc);
+    return;
+  }
+  if (JINGLE_EMB_LEN[idx] > 0) {
+    jEmbMode = true;
+    jStep = (float)JINGLE_EMB_RATE / (float)JINGLE_RATE;
+    jSrcLeft = JINGLE_EMB_LEN[idx];
+    jSrcOk = jPullSrc(&jCurSrc);
+  }
+  Serial.printf("[JN] play %s src=%s\n", JINGLE_WAV[idx],
+                jUseWav ? "sd-wav" : (jEmbMode ? "flash-pcm" : "synth"));
+}
+
+static float jProcSample(uint32_t i) {
+  const JNote* notes = J_NOTES[jCur];
+  int n = J_NCOUNT[jCur];
+  float t = (float)i * (1.0f / (float)JINGLE_RATE);
+  float acc = 0.0f;
+  for (int k = 0; k < n; k++) {
+    float dt = t - notes[k].startMs * 0.001f;
+    if (dt < 0.0f || dt >= notes[k].durMs * 0.001f) continue;
+    float env = expf(-4.5f * dt);
+    if (dt < 0.006f) env *= dt / 0.006f;          // click-free attack
+    float ph = notes[k].f * dt;
+    float a = notes[k].amp * 0.01f;
+    acc += a * (jSine(ph) + 0.20f * jSine(ph * 2.0f) + 0.05f * jSine(ph * 3.0f)) * env;
+  }
+  return acc * 0.55f;    // headroom: overlapping notes must not clip
+}
+
+// Next output frame (mono, full scale). false = chime finished.
+static bool jNextOut() {
+  if (jUseWav || jEmbMode) {
+    if (!jSrcOk) return false;
+    jOutSample = jCurSrc;
+    jFrac += jStep;
+    while (jFrac >= 1.0f) {
+      float v;
+      if (!jPullSrc(&v)) { jSrcOk = false; break; }
+      jCurSrc = v; jFrac -= 1.0f;
+    }
+    jOutIdx++;
+    return true;
+  }
+  if (jOutIdx >= (uint32_t)J_TOTAL_MS[jCur] * JINGLE_RATE / 1000u) return false;
+  jOutSample = jProcSample(jOutIdx);
+  jOutIdx++;
+  return true;
+}
+
+// Blocking playback in the caller's context (SD mode: setup()).
+static void playJingleBlocking(int idx) {
+  if (!audioOut) return;
+  audioOut->jingleMode = true;
+  jingleStart(idx);
+  int16_t fr[2];
+  while (jNextOut()) {
+    int16_t s = (int16_t)(jOutSample * 32000.0f);
+    fr[0] = fr[1] = s;
+    while (!audioOut->ConsumeSample(fr)) delay(1);
+  }
+  audioOut->jingleMode = false;
+  jWavStop();
+  pumpSilence(96);
+}
+
+// BT mode: callbacks only queue a request; the core-0 audio task plays it.
+static volatile int jingleReq = -1;
+static volatile uint32_t jingleLastMs[3] = {0, 0, 0};
+static volatile bool jinglesArmed = false;
+static volatile uint32_t btStartMs = 0;   // BT mode boot time (boot-event guard)
+static volatile bool btSawConnect = false; // a real link-up already happened
+
+static void requestJingle(int idx) {
+  if (idx < 0 || idx > 2) return;
+  uint32_t now = millis();
+  // The stack can report "disconnected" while it is still coming up - that
+  // must not fire the disconnect chime right after the boot chime. Once a
+  // real connect happened, disconnect events are always chime-worthy.
+  if (idx == JINGLE_DISC && !btSawConnect && now - btStartMs < 3000) return;
+  if (idx == JINGLE_CONN) btSawConnect = true;
+  if (now - jingleLastMs[idx] < 1200) return;   // same chime twice -> ignore
+  jingleLastMs[idx] = now;
+  jingleReq = idx;
+}
+
+static void playJingleTask(int idx) {
+  if (!audioOut) return;
+  audioOut->jingleMode = true;
+  jingleStart(idx);
+  int16_t fr[2];
+  while (jNextOut()) {
+    int16_t s = (int16_t)(jOutSample * 32000.0f);
+    fr[0] = fr[1] = s;
+    int tries = 0;
+    while (!audioOut->ConsumeSample(fr)) { vTaskDelay(1); if (++tries > 500) break; }
+    if ((jOutIdx & 0x3FF) == 0) vTaskDelay(1);   // let the BT stack run
+  }
+  audioOut->jingleMode = false;
+  jWavStop();
+  btRingR = btRingW;      // phone frames buffered during the chime are stale
+}
+
 static void drawBtScreen();
 static void handleBtTouch();
 static void exitBtMode();
@@ -1551,6 +1818,9 @@ static void btUiWake() { btUiDirty = true; }
 
 static void btAvrcConnCb(bool connected) {
   if (!connected) { btPeerName[0] = 0; btPhonePct = -1; }
+  // Chime on link up/down. Only a volatile write here — the audio task
+  // does the actual I2S work (never touch I2S from a BT callback).
+  if (jinglesArmed) requestJingle(connected ? JINGLE_CONN : JINGLE_DISC);
   btUiWake();
 }
 
@@ -1586,6 +1856,9 @@ static void btDataCb(const uint8_t* data, uint32_t len) {
 static void btAudioTask(void*) {
   while (true) {
     if (!btModeActive) { vTaskDelay(20); continue; }
+    // Boot / connect / disconnect chime has priority over the phone stream.
+    int jr = jingleReq;
+    if (jr >= 0) { jingleReq = -1; playJingleTask(jr); continue; }
     uint32_t w = btRingW;
     uint32_t avail = w - btRingR;
     if (avail == 0) {
@@ -2300,6 +2573,11 @@ static void runBtModeSetup() {
   loadCal();
   if (!calDone) runCalibration();
 
+  // BT mode never mounts the SD card (that ate the heap Bluedroid needs and
+  // broke pairing) - it uses the PCM embedded in flash. SD files stay an
+  // SD-mode-only override; see tools/make_jingles.py to swap the chimes.
+  Serial.println("[JN] BT mode uses the embedded chimes");
+
   audioOut = new I2SOutTap();
   audioOut->SetPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT);
   audioOut->SetRate(44100);
@@ -2320,6 +2598,11 @@ static void runBtModeSetup() {
   delay(500);
   btConnected = btSink.is_connected();
   Serial.printf("[BT] started heap=%u\n", (unsigned)ESP.getFreeHeap());
+  // startup chime (fixed 20% gain) + arm the connect/disconnect chimes
+  btStartMs = millis();
+  btSawConnect = false;
+  requestJingle(JINGLE_BOOT);
+  jinglesArmed = true;
   drawBtScreen();
 }
 
@@ -2383,15 +2666,21 @@ static void btOnlyHandleTouch() {
 }
 
 static void loopBtMode() {
-  static unsigned long lastPoll = 0, lastConn = 999;
+  static unsigned long lastPoll = 0;
+  static int lastConn = -1;      // -1 = seed from the first poll (no boot chime)
   unsigned long now = millis();
   if (now - lastPoll >= 300) {
     lastPoll = now;
     bool c = btSink.is_connected();
-    if (c != lastConn) {
-      lastConn = c;
+    if (lastConn < 0) {
+      lastConn = c ? 1 : 0;
+      btConnected = c;
+    } else if ((c ? 1 : 0) != lastConn) {
+      lastConn = c ? 1 : 0;
       btConnected = c;
       if (!c) btStreaming = false;
+      // safety net for the chime (requestJingle debounces the callback path)
+      if (jinglesArmed) requestJingle(c ? JINGLE_CONN : JINGLE_DISC);
       Serial.printf("[BT] conn=%d heap=%u drop=%u\n", c ? 1 : 0,
                     (unsigned)ESP.getFreeHeap(), (unsigned)btDropped);
       drawBtScreen();
@@ -2414,6 +2703,8 @@ static void loopSdMode();           // album-player run loop
 void setup() {
   Serial.begin(115200);
   delay(300);
+
+  jingleInit();              // sine table for the boot/connect/disconnect chimes
 
   pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
 
@@ -2479,6 +2770,18 @@ static void runSdModeSetup() {
   xTaskCreatePinnedToCore(btAudioTask, "btAudio", 4096, nullptr, 8, nullptr, 0);
   applyVolumePercent();
 
+  // SD must be mounted before the startup chime: /sounds/boot.wav is the
+  // preferred source, the built-in procedural chime is the fallback.
+  if (!SD.begin(SD_CS)) {
+    tft.setTextColor(TFT_RED,COL_BG);
+    tft.setTextSize(2);
+    tft.setCursor(20,90);
+    tft.print("SD Failed!");
+    while (1) { delay(1000); pollBootButton(); }
+  }
+  sdReady = true;                    // /sounds/*.wav may be used from here on
+  playJingleBlocking(JINGLE_BOOT);   // startup chime (fixed 20% gain)
+
   drawStartupScreen();
 
   // WiFi: ALWAYS try the saved network at boot (radio state in NVS is
@@ -2506,14 +2809,6 @@ static void runSdModeSetup() {
   }
   if (connected) {
     ntpSyncThenRadioOff(6000);   // get time + timezone, then radio off
-  }
-
-  if (!SD.begin(SD_CS)) {
-    tft.setTextColor(TFT_RED,COL_BG);
-    tft.setTextSize(2);
-    tft.setCursor(20,90);
-    tft.print("SD Failed!");
-    while (1) { delay(1000); pollBootButton(); }
   }
 
   scanSD();

@@ -12,3 +12,7 @@ cylp1_*.png
 render_stl*.py
 stl_*.py
 *.stl
+# local dev helpers (mockup render / font checks)
+cyd-album-v2/render_mockup*.py
+cyd-album-v2/check_font.py
+cyd-album-v2/verify_font*.py
