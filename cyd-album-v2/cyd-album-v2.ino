@@ -2015,6 +2015,9 @@ static void drawBtScreen() {
       btCenterLine("connected", 100, 1, GREEN, COL_BG);
       drawBtSpeedLine();
     } else {
+      // no SPEED line while unlinked - clear the band once (the line repaints
+      // in place without clearing, so a stale reading must never stay behind)
+      tft.fillRect(0, 129, SCR_W, 12, COL_BG);
       btCenterLine("waiting for phone ...", 100, 1, COL_DIM, COL_BG);
     }
   }
@@ -2880,7 +2883,12 @@ static void loopBtMode() {
       if (jinglesArmed) requestJingle(c ? JINGLE_CONN : JINGLE_DISC);
       Serial.printf("[BT] conn=%d heap=%u drop=%u\n", c ? 1 : 0,
                     (unsigned)ESP.getFreeHeap(), (unsigned)btDropped);
-      drawBtScreen();
+      // Only repaint when the BT screen owns the display. While a screensaver
+      // is up, drawing the BT screen here left it MIXED with the saver: the
+      // saver keeps stepping its own cells on top of it (Phúc 12/9: unplugging
+      // the phone while the standby screen was showing garbled the panel).
+      // The saver-wake tap redraws the BT screen with the fresh state.
+      if (screenMode == SCREEN_BT) drawBtScreen();
     }
   }
   updateBtUi(now);                 // SUCCESS splash expiry, SPEED window, stats log
