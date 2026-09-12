@@ -1,19 +1,41 @@
 #!/usr/bin/env bash
 # Build firmware CYD + đóng gói 4 vùng flash vào tools/esp-flasher/firmware/<tên>/
 # kèm manifest.json — launcher tự nhận qua /api/firmware
-# Usage: ./build.sh [tên-sketch]   (mặc định cyd-album-v2)
+# Usage: ./build.sh [tên-sketch] [--lite]
+#   --lite : -DJINGLE_NO_EMBED (bản lite) — bỏ ~750 KB PCM nhúng trong flash,
+#            chime lấy từ /sounds/*.wav trên thẻ nhớ (SD mode). BT mode không
+#            mount thẻ nên rơi về chime synth có sẵn trong code.
+#            Xuất ra firmware/<tên>-lite để không ghi đè bản thường.
 set -euo pipefail
 
-NAME="${1:-cyd-album-v2}"
+NAME=""
+LITE=0
+for a in "$@"; do
+  case "$a" in
+    --lite) LITE=1 ;;
+    *) NAME="$a" ;;
+  esac
+done
+NAME="${NAME:-cyd-album-v2}"
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 SKETCH="$ROOT/$NAME"
 OUT="$ROOT/tools/esp-flasher/firmware/$NAME"
 FQBN="esp32:esp32:esp32:PartitionScheme=huge_app"
+EXTRA=""
+if [ "$LITE" = "1" ]; then
+  OUT="$OUT-lite"
+  EXTRA="-DJINGLE_NO_EMBED"
+  echo "==> LITE build: $EXTRA (sounds from /sounds on SD)"
+fi
 
 [ -d "$SKETCH" ] || { echo "Không thấy sketch: $SKETCH"; exit 1; }
 
 echo "==> Compile $NAME"
-arduino-cli compile --fqbn "$FQBN" --output-dir /tmp/cyd-build "$SKETCH" 2>&1 | tail -3
+# NOTE: use compiler.cpp.extra_flags, NOT build.extra_flags — overriding
+# build.extra_flags wipes the platform's own -I paths and the build dies with
+# "i2s.h: No such file or directory" from ESP8266Audio.
+arduino-cli compile --fqbn "$FQBN" --output-dir /tmp/cyd-build \
+  ${EXTRA:+--build-property "compiler.cpp.extra_flags=$EXTRA"} "$SKETCH" 2>&1 | tail -3
 
 B=/tmp/cyd-build
 [ -f "$B/${NAME}.ino.bin" ] || { echo "Build fail: thiếu app bin"; exit 1; }

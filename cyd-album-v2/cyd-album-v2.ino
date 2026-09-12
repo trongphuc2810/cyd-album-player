@@ -36,6 +36,11 @@
   #include "jingles_pcm.h"
 #endif
 
+// Matrix screensaver glyphs (8x8 katakana + digits) - needed in EVERY build,
+// so it must sit OUTSIDE the JINGLE_NO_EMBED branch (the lite build skips the
+// jingles include entirely).
+#include "katakana8x8.h"
+
 // ── Hardware pins ───────────────────────────────────────────
 #define SD_CS      5
 #define TOUCH_CS   33
@@ -59,7 +64,7 @@ XPT2046_Touchscreen ts(TOUCH_CS, TOUCH_IRQ);
 Preferences prefs;
 #define NS_CFG "cyd2"          // display invert / brightness / wifi
 #define BT_DEVICE_NAME "CYD-32-BP"
-#define JINGLE_GAIN 0.20f      // boot/connect/disconnect chimes: fixed 20%, own gain
+#define JINGLE_GAIN 0.05f      // boot/connect/disconnect chimes: fixed 5% (Phúc, 12/9), own gain
 
 // Small subclass that exposes the protected AVRCP volume-notify call so the
 // ESP volume buttons can move the phone's volume too (two-way sync).
@@ -78,29 +83,31 @@ static bool cfgInvert = false;
 static int  cfgBright = 60;    // 0..100
 static char cfgSSID[33] = "";
 static char cfgPass[65] = "";
-static bool wifiRadioOn = true;   // user can power the radio off after NTP sync
-static bool wifiNeedNtp = false;  // re-sync time after radio is turned back on
-static unsigned long wifiBgStartMs = 0;  // when background reconnect began
 
 // ── Bluetooth A2DP Sink state (phone -> CYD-32-BP -> MAX98357A) ──
 static BtSink btSink;
 static bool bootModeBt = false;    // NVS "bootmode"=="bt": clean BT-only boot
 static bool btModeActive = false;   // BT status screen visible
-static bool btStackStarted = false; // BT stack started once (never re-start!)
 static bool btConnected  = false;   // A2DP link up
-static volatile bool btStreaming = false; // PCM frames in the ring
 static bool btUiDirty    = false;   // redraw BT screen from main loop
-static char btPeerName[33]  = "";
-static int  btPhonePct = -1;   // last phone AVRCP volume in %, -1 = unknown yet
-#define BT_ROW_VOL_Y 150       // volume control row
-#define BT_ROW_BRI_Y 210       // brightness control row
-#define BT_CTRL_L 18           // minus button x0
-#define BT_CTRL_LW 44
-#define BT_CTRL_BAR 70         // % display x0
-#define BT_CTRL_BARW 100
-#define BT_CTRL_PLUS 176       // plus button x0
-#define BT_CTRL_H 44
-static unsigned long lastBtDataMs = 0;
+static bool btDrawnConn   = false;  // what the BT screen currently shows (state
+static bool btDrawnSplash = false;  // transition gate: no redraw unless it changed)
+static unsigned long btSuccessUntil = 0;   // 5 s SUCCESS splash after a new link
+static volatile uint32_t btRateBytes = 0;  // incremented by the raw (pre-volume) callback
+static uint32_t btSpeedKbps = 0;           // 1 s window, smoothed, drawn on the BT screen
+// Rows pulled down (Phúc 12/9) now that the Clock chip is gone: 168/240 with
+// 26 px of bottom margin, so the screen is balanced instead of leaving a hole.
+#define BT_ROW_VOL_Y 168       // volume control row
+#define BT_ROW_BRI_Y 240       // brightness control row
+// Control row geometry: 16 | 40 | 16 | 96 | 16 | 40 | 16 = 240 px. The buttons
+// are 40x36 (they were 44x44 and felt oversized), sit 16 px clear of the
+// readout, and the caption below keeps 10 px of air so nothing looks stacked.
+#define BT_CTRL_L 16           // minus button x0
+#define BT_CTRL_LW 40
+#define BT_CTRL_BAR 72         // % display x0 (centre of the row = x 120)
+#define BT_CTRL_BARW 96
+#define BT_CTRL_PLUS 184       // plus button x0
+#define BT_CTRL_H 36
 
 // ── Colors (dark DAP theme) ────────────────────────────────
 #define COL_BG       TFT_BLACK
@@ -148,7 +155,7 @@ static bool screenClockActive = false;   // idle -> big clock
 static bool clockForceRedraw = true;
 static uint8_t bootBtnPhase = 0;
 static unsigned long bootBtnMs = 0;
-static bool mainUiReady = false;
+
 
 static void noteUserActivity() {
   lastUserActivityMs = millis();
@@ -158,6 +165,8 @@ static void noteUserActivity() {
 static void pollBootButton();
 static void redrawCurrentScreen();
 static void enterClockScreen();
+static void svDrawLifeFull();      // BT screensavers (defined with the engines below)
+static void svDrawMatrixFull();
 static void btSwitchToBt();
 
 // ── Backlight PWM ──────────────────────────────────────────
@@ -285,7 +294,6 @@ static int albumScroll = 0;
 static int browseTrackScroll = 0;
 enum BrowseLevel { BROWSE_ALBUMS, BROWSE_TRACKS };
 static BrowseLevel browseLevel = BROWSE_ALBUMS;
-static int browseAlbumIdx = -1;
 static int browseTrackIndices[MAX_TRACKS];
 static int browseTrackCount = 0;
 static char currentAlbumFolder[MAX_ALBUM_NAME_LEN];
@@ -307,10 +315,6 @@ static void getDisplayName(const char* path, char* out, int maxLen) {
   if (dot) *dot = '\0';
 }
 
-static void freePlaylist() {
-  for (int i = 0; i < trackCount; i++) { free(playlist[i]); playlist[i] = nullptr; }
-  trackCount = 0;
-}
 
 static void addFile(const char* path) {
   if (trackCount >= MAX_TRACKS) return;
@@ -822,7 +826,10 @@ static void drawTitleCentered(int y, int maxPx, const char* s) {
 // ── Screens ────────────────────────────────────────────────
 enum ScreenMode { SCREEN_BROWSER, SCREEN_PLAYER, SCREEN_SETTINGS,
                   SCREEN_WIFI_LIST, SCREEN_KEYBOARD, SCREEN_CONNECTING, SCREEN_CLOCK,
-                  SCREEN_BT };
+                  SCREEN_BT,
+                  // BT-mode screensavers (Phúc 12/9): BT has no network, so no
+                  // clock - these two alternate every 5 min of idle instead.
+                  SCREEN_SAVER_LIFE, SCREEN_SAVER_MATRIX };
 static ScreenMode screenMode = SCREEN_BROWSER;
 // remember the screen showing before idle clock, to wake back to it
 static ScreenMode wakeBackScreen = SCREEN_PLAYER;
@@ -1145,88 +1152,82 @@ static void enterClockScreen() {
 }
 
 // ---- Settings ----
-static const int SET_ROW_X=8, SET_ROW_W=224, SET_ROW_H=38, SET_ROW_Y0=40, SET_ROW_GAP=5;
-static int settingsScroll = 0;   // not used, single page
+// Settings layout (variant A: grouped cards, every control on one baseline).
+// SET_ROW_Y is shared by drawSettings() and handleSettingsTouch() so the hit
+// zones can never drift away from the drawn cards.
+static const int SET_ROW_X=8, SET_CARD_W=224, SET_CARD_H=34;
+// 5 rows since the WiFi row was removed (Phúc 12/9, variant A: pulled up with
+// 50 px of breathing room at the bottom). Rows are NAMED - draw() and the touch
+// handler both index through these, so a re-layout cannot drift one from the
+// other (that class of bug already shipped once).
+enum SetRow { SET_INVERT = 0, SET_BRIGHT, SET_BTMODE, SET_RECAL, SET_CLOCK, SET_NROWS };
+static const int SET_ROW_Y[SET_NROWS] = {48, 86, 142, 198, 236};  // card tops
+static const int SET_GRP_Y[3] = {37, 131, 187};                   // DISPLAY / MODE / SYSTEM
+static const int SET_PILL_X=170, SET_PILL_W=50, SET_PILL_H=24;   // ON/OFF pill
+static const int SET_STEP_L=145, SET_STEP_R=201, SET_STEP_BTN=22;  // - / value / + (in-card chips)
+static inline uint16_t setEdge()  { return tft.color565(38,38,44); }
+static inline uint16_t setCtrlBg(){ return tft.color565(45,45,52); }
 static void drawSettings() {
   tft.fillScreen(COL_BG);
-  tft.fillRect(0,0,SCR_W,30,COL_BTN);
-  tft.setTextSize(2);
-  tft.setTextColor(COL_TEXT,COL_BTN);
-  tft.setCursor(10,6);
-  tft.print("Settings");
+  tft.fillRect(0,0,SCR_W,30,colTopBarBg());
+  tft.drawFastHLine(0,29,SCR_W,tft.color565(40,40,48));
   tft.setTextSize(1);
-  tft.setTextColor(colInfoCyan(),COL_BTN);
-  tft.setCursor(170,10);
-  tft.print("< back");
+  tft.setTextColor(colInfoCyan(),colTopBarBg());
+  tft.setCursor(10,12); tft.print("Settings");
+  tft.setCursor(176,12); tft.print("< back");
 
-  int y=SET_ROW_Y0;
-  // Invert row
-  tft.fillRoundRect(SET_ROW_X,y,SET_ROW_W,SET_ROW_H,8,COL_BTN);
-  tft.setTextSize(1); tft.setTextColor(COL_TEXT,COL_BTN);
-  tft.setCursor(18,y+8); tft.print("Display invert");
-  tft.fillRoundRect(150,y+10,66,24,12,cfgInvert?tft.color565(88,190,245):tft.color565(70,70,70));
-  tft.setTextColor(cfgInvert?COL_BG:COL_DIM,cfgInvert?tft.color565(88,190,245):tft.color565(70,70,70));
-  tft.setCursor(166,y+16); tft.print(cfgInvert?"ON":"OFF");
-  y+=SET_ROW_H+SET_ROW_GAP;
-  // Bluetooth mode row (auto SD / enter BT status screen)
-  tft.fillRoundRect(SET_ROW_X,y,SET_ROW_W,SET_ROW_H,8,COL_BTN);
-  tft.setTextSize(1); tft.setTextColor(COL_TEXT,COL_BTN);
-  tft.setCursor(18,y+8); tft.print("Bluetooth mode");
-  tft.setTextColor(btConnected?tft.color565(60,200,90):COL_DIM,COL_BTN);
-  tft.setCursor(118,y+8); tft.print(btConnected?"connected":"SD mode");
-  tft.setTextColor(COL_DIM,COL_BTN); tft.setCursor(204,y+11); tft.print(">");
-  y+=SET_ROW_H+SET_ROW_GAP;
-  // Brightness row
-  tft.fillRoundRect(SET_ROW_X,y,SET_ROW_W,SET_ROW_H,8,COL_BTN);
-  tft.setTextColor(COL_TEXT,COL_BTN); tft.setCursor(18,y+8); tft.print("Brightness");
-  tft.fillRoundRect(158,y+7,26,30,6,tft.color565(45,45,52));
-  tft.setTextColor(COL_TEXT,tft.color565(45,45,52)); tft.setCursor(165,y+13); tft.print("-");
-  tft.setTextColor(COL_TEXT,COL_BTN);
-  char bbuf[8]; snprintf(bbuf,sizeof(bbuf),"%d%%",cfgBright);
-  tft.setCursor(SCR_W/2-9,y+8); tft.print(bbuf);
-  tft.fillRoundRect(206,y+7,26,30,6,tft.color565(45,45,52));
-  tft.setTextColor(COL_TEXT,tft.color565(45,45,52)); tft.setCursor(213,y+13); tft.print("+");
-  y+=SET_ROW_H+SET_ROW_GAP;
-  // WiFi row: left = status/change network, right = radio ON/OFF toggle
-  tft.fillRoundRect(SET_ROW_X,y,SET_ROW_W,SET_ROW_H,8,COL_BTN);
-  tft.setTextColor(COL_TEXT,COL_BTN); tft.setCursor(18,y+8); tft.print("WiFi");
-  if (!wifiRadioOn) {
-    tft.setTextColor(COL_DIM,COL_BTN);
-    tft.setCursor(60,y+8); tft.print("Radio off");
-  } else if (WiFi.status()==WL_CONNECTED && cfgSSID[0]) {
-    tft.setTextColor(tft.color565(60,200,90),COL_BTN);
-    tft.setCursor(60,y+8);
-    char ss[14]; strncpy(ss,cfgSSID,13); ss[13]='\0';
-    tft.print(ss);
-  } else {
-    tft.setTextColor(COL_DIM,COL_BTN);
-    tft.setCursor(60,y+8); tft.print("Connecting..");
+  // group labels (WiFi row gone -> NETWORK renamed MODE, variant A spacing)
+  tft.setTextColor(colInfoCyan(),COL_BG);
+  tft.setCursor(14,SET_GRP_Y[0]); tft.print("DISPLAY");
+  tft.setCursor(14,SET_GRP_Y[1]); tft.print("MODE");
+  tft.setCursor(14,SET_GRP_Y[2]); tft.print("SYSTEM");
+
+  for (int i=0;i<SET_NROWS;i++) {
+    int y=SET_ROW_Y[i];
+    tft.fillRoundRect(SET_ROW_X,y,SET_CARD_W,SET_CARD_H,8,COL_BTN);
+    tft.drawRoundRect(SET_ROW_X,y,SET_CARD_W,SET_CARD_H,8,setEdge());
   }
-  // toggle pill
-  uint16_t onCol = wifiRadioOn ? tft.color565(88,190,245) : tft.color565(70,70,70);
-  tft.fillRoundRect(150,y+10,66,24,12,onCol);
-  tft.setTextColor(wifiRadioOn?COL_BG:COL_DIM, onCol);
-  tft.setCursor(166,y+16); tft.print(wifiRadioOn?"ON":"OFF");
-  y+=SET_ROW_H+SET_ROW_GAP;
-  // Recalibrate touch row
-  tft.fillRoundRect(SET_ROW_X,y,SET_ROW_W,SET_ROW_H,8,COL_BTN);
-  tft.setTextColor(COL_TEXT,COL_BTN); tft.setCursor(18,y+8); tft.print("Recalibrate touch");
-  tft.setTextColor(COL_DIM,COL_BTN); tft.setCursor(150,y+16); tft.print("run 4 taps");
-  y+=SET_ROW_H+SET_ROW_GAP;
-  // Clock view row (tap to preview the idle clock screen)
-  tft.fillRoundRect(SET_ROW_X,y,SET_ROW_W,SET_ROW_H,8,COL_BTN);
-  tft.setTextColor(COL_TEXT,COL_BTN); tft.setCursor(18,y+8); tft.print("Clock");
-  tft.setTextColor(COL_DIM,COL_BTN); tft.setCursor(150,y+16); tft.print("view now");
-  y+=SET_ROW_H+SET_ROW_GAP;
-  // Clock note
-  tft.setTextSize(1);
-  tft.setTextColor(COL_DIM,COL_BG);
-  tft.setCursor(12,y+2);
-  tft.print("Idle: 5 min no touch -> clock");
+  tft.setTextColor(COL_TEXT,COL_BTN);
+  tft.setCursor(18,SET_ROW_Y[SET_INVERT]+13); tft.print("Display invert");
+  tft.setCursor(18,SET_ROW_Y[SET_BRIGHT]+13); tft.print("Brightness");
+  tft.setCursor(18,SET_ROW_Y[SET_BTMODE]+13); tft.print("Bluetooth mode");
+  tft.setCursor(18,SET_ROW_Y[SET_RECAL]+13);  tft.print("Recalibrate touch");
+  tft.setCursor(18,SET_ROW_Y[SET_CLOCK]+13);  tft.print("Clock");
+
+  // invert toggle
+  { int y=SET_ROW_Y[SET_INVERT];
+    uint16_t col=cfgInvert?tft.color565(88,190,245):tft.color565(70,70,70);
+    tft.fillRoundRect(SET_PILL_X,y+5,SET_PILL_W,SET_PILL_H,12,col);
+    tft.setTextColor(cfgInvert?COL_BG:tft.color565(200,200,205),col);
+    tft.setCursor(SET_PILL_X+((SET_PILL_W-6*(cfgInvert?2:3))/2),y+14);
+    tft.print(cfgInvert?"ON":"OFF");
+  }
+  // brightness stepper - two 22x22 chips INSIDE the card (one frame only)
+  { int y=SET_ROW_Y[SET_BRIGHT];
+    tft.fillRoundRect(SET_STEP_L,y+6,SET_STEP_BTN,SET_STEP_BTN,5,setCtrlBg());
+    tft.setTextColor(COL_TEXT,setCtrlBg()); tft.setCursor(SET_STEP_L+8,y+13); tft.print("-");
+    char b[8]; snprintf(b,sizeof(b),"%d%%",cfgBright);
+    tft.setTextColor(COL_TEXT,COL_BTN);
+    tft.setCursor(184-3*(int)strlen(b),y+14); tft.print(b);
+    tft.fillRoundRect(SET_STEP_R,y+6,SET_STEP_BTN,SET_STEP_BTN,5,setCtrlBg());
+    tft.setTextColor(COL_TEXT,setCtrlBg()); tft.setCursor(SET_STEP_R+8,y+13); tft.print("+");
+  }
+  // bluetooth mode (state only, value right aligned)
+  { const char* v = btConnected?"connected":"SD mode";
+    tft.setTextColor(btConnected?tft.color565(60,200,90):COL_DIM,COL_BTN);
+    tft.setCursor(214-6*(int)strlen(v),SET_ROW_Y[SET_BTMODE]+13); tft.print(v);
+  }
+  // action rows, value right aligned
+  tft.setTextColor(COL_DIM,COL_BTN);
+  tft.setCursor(214-60,SET_ROW_Y[SET_RECAL]+13); tft.print("run 4 taps");
+  tft.setCursor(214-48,SET_ROW_Y[SET_CLOCK]+13); tft.print("view now");
 }
 
 // ---- WiFi list ----
 #define WIFI_MAX 14
+// Shared by drawWifiList() and handleWifiListTouch() so the hit zones can never
+// drift from the drawn rows (24 px pitch like the album list -> 10 rows fit).
+static const int WL_Y0=42, WL_ITEMH=24, WL_VIS=10;
 static char wifiNames[WIFI_MAX][33];
 static int wifiRssi[WIFI_MAX];
 static bool wifiLocked[WIFI_MAX];
@@ -1235,6 +1236,12 @@ static bool wifiScanDone=false;
 static int wifiScanRetries=0;
 static unsigned long wifiScanStartedAt=0;
 static int kbTargetSSIDIdx = -1;
+// Boot-phase WiFi setup (Phúc 12/9): when no network is saved the SAME list +
+// keyboard screens run from setup(), before the mode starts. bootWifiPhase
+// turns the list's header from "< back" into "< skip" (at boot there is nothing
+// to go back to, and the user must still be able to boot without a network).
+static bool bootWifiPhase = false;
+static bool bootWifiSkip = false;
 
 static void startWifiScan() {
   wifiScanDone=false;
@@ -1309,7 +1316,8 @@ static void drawWifiList() {
   tft.setTextSize(2); tft.setTextColor(COL_TEXT,COL_BTN);
   tft.setCursor(10,6); tft.print("WiFi");
   tft.setTextSize(1); tft.setTextColor(colInfoCyan(),COL_BTN);
-  tft.setCursor(176,10); tft.print("< back");
+  // boot phase: nothing to go back to -> the same corner means "skip"
+  tft.setCursor(176,10); tft.print(bootWifiPhase ? "< skip" : "< back");
   if (!wifiScanDone) {
     tft.setTextColor(COL_DIM,COL_BG);
     const char* m="Scanning...";
@@ -1326,20 +1334,28 @@ static void drawWifiList() {
     tft.setCursor(104,300); tft.print("check router");
     return;
   }
-  int vis=8, y0=42, itemH=30;
+  int vis=WL_VIS, y0=WL_Y0, itemH=WL_ITEMH;
   for (int i=0;i<vis;i++){
     int idx=wifiScroll+i;
     if (idx>=wifiCount) break;
     int y=y0+i*itemH;
-    tft.fillRoundRect(6,y,228,itemH-4,6,COL_DIR);
+    // same row geometry as the album browser: 24 px pitch, 21 px pill, text +7
+    tft.fillRoundRect(6,y+1,228,itemH-3,5,COL_DIR);
     tft.setTextSize(1);
     char line[40];
     snprintf(line,sizeof(line),"%.24s",wifiNames[idx]);
     tft.setTextColor(COL_TEXT,COL_DIR);
-    tft.setCursor(14,y+10); tft.print(line);
+    tft.setCursor(12,y+7); tft.print(line);
+    // fixed-width signal meter (4 bars, 188..203) so it can never run into the lock
+    int lvl = wifiRssi[idx] > -55 ? 4 : wifiRssi[idx] > -65 ? 3 : wifiRssi[idx] > -75 ? 2 : 1;
+    for (int b=0;b<4;b++){
+      int bh=2+b*2;
+      uint16_t bc = (b<lvl) ? (lvl>=3?colInfoCyan():COL_DIM) : tft.color565(30,30,34);
+      tft.fillRect(188+b*4, y+17-bh, 3, bh, bc);
+    }
     if (wifiLocked[idx]) {
       tft.setTextColor(colInfoCyan(),COL_DIR);
-      tft.setCursor(202,y+10); tft.print("*");
+      tft.setCursor(212,y+7); tft.print("*");
     }
   }
   int totalPages=max(1,(wifiCount+vis-1)/vis);
@@ -1360,6 +1376,7 @@ static const char* KB_ROWS[] = {
 };
 static const int KB_NROW=5, KB_KEY_H=38, KB_Y0=86;
 static bool kbShift=false;
+static bool kbShowPass=false;   // reveal the typed password (one field, never two lines)
 static char kbPass[65]="";
 static int kbCur=0;
 static char kbSSIDName[33]="";
@@ -1375,20 +1392,38 @@ static char kbCharAt(int row, int col) {
 
 static void drawKeyboard() {
   tft.fillScreen(COL_BG);
-  // header
-  tft.fillRect(0,0,SCR_W,82,COL_BTN);
+  // header: title + back
+  tft.fillRect(0,0,SCR_W,30,colTopBarBg());
+  tft.drawFastHLine(0,29,SCR_W,tft.color565(40,40,48));
   tft.setTextSize(1);
-  tft.setTextColor(colInfoCyan(),COL_BTN);
-  tft.setCursor(10,4); tft.print(kbSSIDName);
-  tft.setTextColor(COL_DIM,COL_BTN);
-  tft.setCursor(10,22); tft.print("Password:");
-  tft.setTextColor(COL_YEL,COL_BTN);
-  char dots[34]; int n=kbCur; if (n>32) n=32;
-  for (int i=0;i<n;i++) dots[i]='*';
-  dots[n]='\0';
-  tft.setCursor(10,40); tft.print(dots);
-  tft.setTextColor(COL_DIM,COL_BTN);
-  tft.setCursor(10,58); tft.print(kbPass);
+  tft.setTextColor(colInfoCyan(),colTopBarBg());
+  tft.setCursor(10,12); tft.print("WiFi password");
+  tft.setCursor(186,12); tft.print("< back");
+  // network + label on one line, then a single framed password field
+  tft.setTextColor(colInfoCyan(),COL_BG);
+  tft.setCursor(10,34); tft.print(kbSSIDName[0]?kbSSIDName:"(hidden)");
+  tft.setTextColor(COL_DIM,COL_BG);
+  tft.setCursor(146,34); tft.print("Password:");
+  uint16_t fldBg = tft.color565(22,22,26);
+  tft.fillRoundRect(8,46,224,28,6,fldBg);
+  tft.drawRoundRect(8,46,224,28,6,tft.color565(70,70,78));
+  char shown[80];
+  if (kbShowPass) {
+    strncpy(shown,kbPass,sizeof(shown)-1); shown[sizeof(shown)-1]='\0';
+  } else {
+    int n=kbCur; if (n>33) n=33;
+    for (int i=0;i<n;i++) shown[i]='*';
+    shown[n]='\0';
+  }
+  tft.setTextColor(COL_TEXT,fldBg);
+  tft.setCursor(14,56); tft.print(shown);
+  // the chip sits INSIDE the field frame with a real margin (was a 46x26 box
+  // breaking the frame's right edge)
+  uint16_t chipBg = tft.color565(45,45,52);
+  tft.fillRoundRect(186,51,38,18,4,chipBg);
+  tft.setTextColor(colInfoCyan(),chipBg);
+  { const char* cs = kbShowPass?"Hide":"Show";
+    tft.setCursor(186+(38-6*(int)strlen(cs))/2,56); tft.print(cs); }
   // keys
   int colW=24;
   for (int row=0;row<KB_NROW;row++){
@@ -1431,7 +1466,7 @@ static void kbAddChar(char c) {
 
 // ── WiFi connect flow ──────────────────────────────────────
 static unsigned long wifiConnStart=0;
-static char lastErrMsg[40]="";
+
 
 static void saveWifiCreds(const char* ssid, const char* pass) {
   strncpy(cfgSSID,ssid,32); cfgSSID[32]='\0';
@@ -1442,22 +1477,6 @@ static void saveWifiCreds(const char* ssid, const char* pass) {
   prefs.end();
 }
 
-static bool tryConnectSavedWifi() {
-  if (!cfgSSID[0]) return false;
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(cfgSSID, cfgPass);
-  unsigned long t0=millis();
-  while (millis()-t0 < 9000) {
-    if (WiFi.status()==WL_CONNECTED) return true;
-    audioPumpDecode(32);
-    delay(50);
-    tft.setTextSize(1); tft.setTextColor(COL_DIM,COL_BG);
-    tft.setCursor(20,150); tft.print("Connecting WiFi...");
-    yield();
-  }
-  WiFi.disconnect();
-  return false;
-}
 
 static void startNtp() {
   configTime(7*3600, 0, "pool.ntp.org", "time.nist.gov");
@@ -1474,7 +1493,6 @@ static void ntpSyncThenRadioOff(unsigned long maxWaitMs) {
   if (now >= 1700000000L) clockPersist();  // save epoch so clock survives reboot
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
-  wifiRadioOn = false;
   wifiConnecting = false;
   wifiScanDone = true;
 }
@@ -1499,7 +1517,6 @@ static void updateWifiConnecting() {
   if (millis()-wifiConnStart > 12000) {
     wifiConnecting=false;
     WiFi.disconnect();
-    strncpy(lastErrMsg,"WiFi failed",sizeof(lastErrMsg)-1);
     screenMode = SCREEN_WIFI_LIST;
     startWifiScan();
     drawWifiList();
@@ -1508,35 +1525,6 @@ static void updateWifiConnecting() {
 }
 
 // ── WiFi radio power (user toggle: off saves power/interference after NTP) ──
-static void setWifiRadio(bool on) {
-  wifiRadioOn = on;
-  prefs.begin(NS_CFG, false);
-  prefs.putBool("wifiOn", on);
-  prefs.end();
-  if (on) {
-    WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
-    if (cfgSSID[0]) {
-      // saved network: reconnect quietly (no screen jump if we were in settings)
-      wifiNeedNtp = true;
-      wifiBgStartMs = millis();
-      WiFi.begin(cfgSSID, cfgPass);
-    } else {
-      // no saved network -> open scan list
-      wakeBackScreen = SCREEN_SETTINGS;
-      screenMode = SCREEN_WIFI_LIST;
-      wifiScroll = 0;
-      startWifiScan();
-      drawWifiList();
-    }
-  } else {
-    // power the radio fully off
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    wifiConnecting = false;
-    wifiScanDone = true;
-  }
-}
 
 // ═══════════════════════════════════════════════════════════
 // Bluetooth A2DP Sink (clean integration on the vol5 base)
@@ -1553,7 +1541,7 @@ static void setWifiRadio(bool on) {
 static int16_t btRing[BT_RING_FRAMES * 2];
 static volatile uint32_t btRingW = 0, btRingR = 0;
 static volatile uint32_t btDropped = 0;
-static volatile uint32_t btTotal = 0;
+
 static int16_t btChunk[1024 * 2];    // audio task transfers in big chunks
 
 // ═══════════════════════════════════════════════════════════
@@ -1762,10 +1750,13 @@ static void playJingleBlocking(int idx) {
   audioOut->jingleMode = true;
   jingleStart(idx);
   int16_t fr[2];
+  uint32_t frames = 0;
   while (jNextOut()) {
     int16_t s = (int16_t)(jOutSample * 32000.0f);
     fr[0] = fr[1] = s;
-    while (!audioOut->ConsumeSample(fr)) delay(1);
+    int tries = 0;
+    while (!audioOut->ConsumeSample(fr)) { delay(1); if (++tries > 500) break; }
+    if (++frames > 400000UL) break;   // hard cap (~9 s): never hang the boot
   }
   audioOut->jingleMode = false;
   jWavStop();
@@ -1810,33 +1801,24 @@ static void playJingleTask(int idx) {
 }
 
 static void drawBtScreen();
-static void handleBtTouch();
-static void exitBtMode();
 static bool btHandleCtrl(int16_t tx, int16_t ty);
 
 static void btUiWake() { btUiDirty = true; }
 
 static void btAvrcConnCb(bool connected) {
-  if (!connected) { btPeerName[0] = 0; btPhonePct = -1; }
+  // Name is DELIBERATELY kept on disconnect: it is the remembered identity
+  // shown while waiting for the phone again.
+  // (phone AVRCP volume is intentionally NOT read: both sides stay independent)
   // Chime on link up/down. Only a volatile write here — the audio task
   // does the actual I2S work (never touch I2S from a BT callback).
   if (jinglesArmed) requestJingle(connected ? JINGLE_CONN : JINGLE_DISC);
   btUiWake();
 }
 
-// Phone volume event (0..127) from AVRCP. The lib already applied the
-// phone's own scaling to the stream (volume_set_by_controller runs before
-// this callback) - so the phone side is INDEPENDENT: we only read its level
-// for the on-screen readout and never touch the ESP gain from here.
-static void btVolumeCb(int v) {
-  btPhonePct = (constrain(v,0,127) * 100 + 63) / 127;
-  btUiWake();
-}
+
 
 static void btDataCb(const uint8_t* data, uint32_t len) {
   if (!btModeActive || !data) return;
-  lastBtDataMs = millis();
-  if (!btStreaming) btStreaming = true;
   const int16_t* p = (const int16_t*)data;
   uint32_t n = len / 4;                       // bytes -> stereo s16 frames
   uint32_t w = btRingW;
@@ -1847,7 +1829,7 @@ static void btDataCb(const uint8_t* data, uint32_t len) {
     w++;
   }
   btRingW = w;
-  btTotal += n;
+
 }
 
 // Dedicated BT audio writer: pinned to core 0 with high priority so the
@@ -1906,144 +1888,129 @@ static void btCenterLine(const char* s, int y, int size, uint16_t col, uint16_t 
   tft.setTextSize(1);
 }
 
+/** Raw reader: fires before the volume control with the same decoded PCM.
+ *  Used ONLY to measure how much audio the phone actually delivers (bytes/s). */
+static void btRawCb(const uint8_t* data, uint32_t len) {
+  if (!btModeActive || !data) return;
+  btRateBytes += len;
+}
+
+/** SPEED line on the BT screen: kbps the phone is delivering (0 when idle). */
+static void drawBtSpeedLine() {
+  if (screenMode != SCREEN_BT || screenClockActive) return;
+  char s[32];
+  // FIXED 4-char field: the string length never changes, so the opaque text
+  // repaints over the previous digits and the band is never cleared (a
+  // fillRect per second was visible as continuous flicker during playback).
+  if (btSpeedKbps) snprintf(s, sizeof(s), "SPEED %4u kbps", (unsigned)btSpeedKbps);
+  else             snprintf(s, sizeof(s), "SPEED ---- kbps");
+  int len = (int)strlen(s);
+  tft.setTextSize(1);
+  tft.setTextColor(colInfoCyan(), COL_BG);
+  tft.setCursor((SCR_W - len*6)/2, 132);
+  tft.print(s);
+}
+
+/** BT-mode housekeeping: SUCCESS splash expiry, 1 s SPEED window, stats log.
+ *  Called from both BT run loops (BT-only boot and switched-at-runtime). */
+static void updateBtUi(unsigned long now) {
+  if (btSuccessUntil && (long)(now - btSuccessUntil) >= 0) {
+    btSuccessUntil = 0;
+    btUiWake();                        // splash over -> steady screen
+  }
+  static unsigned long lastRateMs = 0;
+  static uint32_t lastBytes = 0;
+  static unsigned long lastStatMs = 0;
+  if (now - lastRateMs >= 1000) {
+    lastRateMs = now;
+    uint32_t b = btRateBytes;
+    uint32_t kbps = (uint32_t)(((uint64_t)(b - lastBytes) * 8ull) / 1000ull);
+    lastBytes = b;
+    uint32_t prev = btSpeedKbps;
+    btSpeedKbps = kbps ? (prev ? (prev * 2u + kbps) / 3u : kbps) : 0;   // smooth, snap to 0
+    if (btConnected && btSpeedKbps != prev && screenMode == SCREEN_BT) drawBtSpeedLine();
+  }
+  if (now - lastStatMs >= 10000) {     // log only: link health / clock drift check
+    lastStatMs = now;
+    Serial.printf("[BT] stat heap=%u drop=%u speed=%u\n",
+                  (unsigned)ESP.getFreeHeap(), (unsigned)btDropped,
+                  (unsigned)btSpeedKbps);
+  }
+}
+
 static void drawBtScreen() {
   btUiDirty = false;
   tft.fillScreen(COL_BG);
-  // header
+  // header: title at size 1 (smaller) + the SD switch
   tft.fillRect(0,0,SCR_W,30,colTopBarBg());
   tft.drawFastHLine(0,29,SCR_W,tft.color565(40,40,48));
-  tft.setTextSize(2); tft.setTextColor(COL_TEXT,colTopBarBg());
-  tft.setCursor(10,6); tft.print("Bluetooth mode");
   tft.setTextSize(1); tft.setTextColor(colInfoCyan(),colTopBarBg());
+  tft.setCursor(10,12); tft.print("Bluetooth");
   tft.setCursor(196,12); tft.print("< SD");
 
-  // status zone (waiting or connected)
+  const uint16_t GREEN = tft.color565(60,200,90);
   bool conn = btConnected;
-  drawBtRune(120, 58, conn ? tft.color565(60,200,90) : colInfoCyan());
-  const char* nm = (conn && btPeerName[0]) ? btPeerName : "CYD-32-BP";
-  btCenterLine(nm, 84, 2, COL_TEXT, COL_BG);
-  btCenterLine(conn ? "connected" : "waiting for phone ...", 118, 1,
-               conn ? tft.color565(60,200,90) : COL_DIM, COL_BG);
-  if (conn) {
-    char sline[48];
-    snprintf(sline, sizeof(sline), "device: %s", btPeerName[0] ? btPeerName : "Phone");
-    btCenterLine(sline, 132, 1, COL_DIM, COL_BG);
+  // NO peer-name row (Phúc, 12/9): the AVRCP name never arrives on some
+  // phones and a placeholder reads as faked data - show the connection
+  // state and the live numbers only.
+  bool splash = conn && btSuccessUntil != 0 && (long)(millis() - btSuccessUntil) < 0;
+
+  // Variant B (Phúc 12/9): state word at y=100, remembered phone name as a
+  // small line under it (cyan = linked, grey = remembered but not linked).
+  // No name saved yet -> nothing is drawn (never a placeholder).
+  // No phone-name row (Phúc 12/9): the AVRCP name is unreliable on his phone,
+  // so the screen shows the connection state + live numbers only.
+  btDrawnConn = conn; btDrawnSplash = splash;   // what this frame shows
+  if (splash) {
+    // first 5 s after a new link: text only, no icon
+    btCenterLine("SUCCESS", 76, 2, GREEN, COL_BG);
+    btCenterLine("connected", 100, 1, GREEN, COL_BG);
+  } else {
+    drawBtRune(120, 52, conn ? GREEN : colInfoCyan());
+    if (conn) {
+      btCenterLine("connected", 100, 1, GREEN, COL_BG);
+      drawBtSpeedLine();
+    } else {
+      btCenterLine("waiting for phone ...", 100, 1, COL_DIM, COL_BG);
+    }
   }
 
   // volume control row (works on the ESP, syncs with the phone)
   tft.fillRoundRect(BT_CTRL_L, BT_ROW_VOL_Y, BT_CTRL_LW, BT_CTRL_H, 7, COL_BTN);
   tft.setTextSize(2); tft.setTextColor(COL_TEXT, COL_BTN);
-  tft.setCursor(BT_CTRL_L + BT_CTRL_LW/2 - 6, BT_ROW_VOL_Y + 14); tft.print("-");
+  tft.setCursor(BT_CTRL_L + BT_CTRL_LW/2 - 6, BT_ROW_VOL_Y + 10); tft.print("-");
   tft.fillRoundRect(BT_CTRL_BAR, BT_ROW_VOL_Y, BT_CTRL_BARW, BT_CTRL_H, 7, COL_BTN);
   char vbuf[8]; snprintf(vbuf,sizeof(vbuf),"%d%%",volumePercent);
   tft.setTextColor(colInfoCyan(), COL_BTN);
-  tft.setCursor(BT_CTRL_BAR + BT_CTRL_BARW/2 - (int)strlen(vbuf)*6, BT_ROW_VOL_Y + 14);
+  tft.setCursor(BT_CTRL_BAR + BT_CTRL_BARW/2 - (int)strlen(vbuf)*6, BT_ROW_VOL_Y + 10);
   tft.print(vbuf);
   tft.fillRoundRect(BT_CTRL_PLUS, BT_ROW_VOL_Y, BT_CTRL_LW, BT_CTRL_H, 7, COL_BTN);
   tft.setTextColor(COL_TEXT, COL_BTN);
-  tft.setCursor(BT_CTRL_PLUS + BT_CTRL_LW/2 - 6, BT_ROW_VOL_Y + 14); tft.print("+");
+  tft.setCursor(BT_CTRL_PLUS + BT_CTRL_LW/2 - 6, BT_ROW_VOL_Y + 10); tft.print("+");
   tft.setTextSize(1);
-  if (conn && btPhonePct >= 0) {
-    char pl[40]; snprintf(pl, sizeof(pl), "ESP %d%%   Phone %d%%", volumePercent, btPhonePct);
-    btCenterLine(pl, BT_ROW_VOL_Y + BT_CTRL_H + 8, 1, COL_DIM, COL_BG);
-  } else if (conn) {
-    btCenterLine("ESP volume (phone sync chua nhan)", BT_ROW_VOL_Y + BT_CTRL_H + 8, 1, COL_DIM, COL_BG);
-  } else {
-    btCenterLine("Volume ESP (chua ket noi)", BT_ROW_VOL_Y + BT_CTRL_H + 8, 1, COL_DIM, COL_BG);
-  }
+  btCenterLine("Volume", BT_ROW_VOL_Y + BT_CTRL_H + 10, 1, COL_DIM, COL_BG);
 
   // brightness control row
   tft.fillRoundRect(BT_CTRL_L, BT_ROW_BRI_Y, BT_CTRL_LW, BT_CTRL_H, 7, COL_BTN);
   tft.setTextSize(2); tft.setTextColor(COL_TEXT, COL_BTN);
-  tft.setCursor(BT_CTRL_L + BT_CTRL_LW/2 - 6, BT_ROW_BRI_Y + 14); tft.print("-");
+  tft.setCursor(BT_CTRL_L + BT_CTRL_LW/2 - 6, BT_ROW_BRI_Y + 10); tft.print("-");
   tft.fillRoundRect(BT_CTRL_BAR, BT_ROW_BRI_Y, BT_CTRL_BARW, BT_CTRL_H, 7, COL_BTN);
   char bbuf[8]; snprintf(bbuf,sizeof(bbuf),"%d%%",cfgBright);
   tft.setTextColor(colInfoCyan(), COL_BTN);
-  tft.setCursor(BT_CTRL_BAR + BT_CTRL_BARW/2 - (int)strlen(bbuf)*6, BT_ROW_BRI_Y + 14);
+  tft.setCursor(BT_CTRL_BAR + BT_CTRL_BARW/2 - (int)strlen(bbuf)*6, BT_ROW_BRI_Y + 10);
   tft.print(bbuf);
   tft.fillRoundRect(BT_CTRL_PLUS, BT_ROW_BRI_Y, BT_CTRL_LW, BT_CTRL_H, 7, COL_BTN);
   tft.setTextColor(COL_TEXT, COL_BTN);
-  tft.setCursor(BT_CTRL_PLUS + BT_CTRL_LW/2 - 6, BT_ROW_BRI_Y + 14); tft.print("+");
+  tft.setCursor(BT_CTRL_PLUS + BT_CTRL_LW/2 - 6, BT_ROW_BRI_Y + 10); tft.print("+");
   tft.setTextSize(1);
-  btCenterLine("Brightness", BT_ROW_BRI_Y + BT_CTRL_H + 8, 1, COL_DIM, COL_BG);
+  btCenterLine("Brightness", BT_ROW_BRI_Y + BT_CTRL_H + 10, 1, COL_DIM, COL_BG);
+  // No Clock button any more (Phúc 12/9): BT mode cannot fetch the time, so the
+  // area is intentionally empty - the screensavers take over after 5 min idle.
 }
 
-static void handleBtTouch() {
-  int16_t tx,ty;
-  if (!getTouchXY(tx,ty)) return;
-  noteUserActivity();
-  unsigned long now=millis();
-  if (now-lastTouchTime<TOUCH_DEBOUNCE_MS) return;
-  lastTouchTime=now;
-  while (ts.touched()) { delay(1); if (millis()-now>400) break; }
-  // back to SD
-  if (ty<30 && tx>=150) { exitBtMode(); return; }
-  if (btHandleCtrl(tx,ty)) drawBtScreen();
-}
 
-static void updateBtPoll() {
-  if (!btModeActive) return;
-  static unsigned long lastPoll=0;
-  unsigned long now=millis();
-  if (now-lastPoll<400) return;
-  lastPoll=now;
-  bool c = btSink.is_connected();
-  if (c != btConnected) {
-    btConnected = c;
-    btPhonePct = -1;                 // unknown until the phone reports volume
-    Serial.printf("[BT] conn=%d heap=%u drop=%u\n", c?1:0,
-                  (unsigned)ESP.getFreeHeap(), (unsigned)btDropped);
-    if (!c) btStreaming = false;
-    btUiWake();
-  }
-  if (btConnected && now-lastBtDataMs>350) btStreaming = false;
-  static bool lastStream=false;
-  bool s=btStreaming;
-  if (s!=lastStream) { lastStream=s; btUiWake(); }   // redraw on start/stop of audio
-}
 
-static void enterBtMode() {
-  if (btModeActive) return;
-  // stop SD playback (SD and BT share the same I2S output)
-  if (playerState != STATE_STOPPED) stopTrack(true);
-  // Bluetooth owns the 2.4GHz radio -> WiFi off, then let the controller
-  // actually release it before the BT stack starts (avoids "can't pair").
-  setWifiRadio(false);
-  delay(600);
-  // volume = our own gain, same percentage as SD mode
-  audioOut->requestFade(false);
-  applyVolumePercent();
-  // start the BT stack exactly once - never end()/restart it afterwards.
-  // WiFi MUST be fully off first: the 2.4G controller is shared and a
-  // still-awake WiFi radio can stop the stack from becoming discoverable.
-  if (!btStackStarted) {
-    Serial.printf("[BT] start %s heap=%u\n", BT_DEVICE_NAME, (unsigned)ESP.getFreeHeap());
-    btSink.start(BT_DEVICE_NAME);
-    btStackStarted = true;
-    delay(400);          // let it advertise before the UI says "waiting"
-  }
-  btModeActive = true;
-  btConnected = btSink.is_connected();
-  btPeerName[0] = 0;
-  btUiDirty = true;
-  screenMode = SCREEN_BT;
-  wakeBackScreen = SCREEN_BROWSER;
-  drawBtScreen();
-}
 
-static void exitBtMode() {
-  if (!btModeActive) return;
-  btModeActive = false;
-  // disconnect the phone but KEEP the stack running (restarting crashes)
-  btSink.disconnect();
-  btConnected = false;
-  btStreaming = false;
-  audioOut->requestFade(false);
-  applyVolumePercent();
-  screenMode = SCREEN_BROWSER;
-  wakeBackScreen = SCREEN_BROWSER;
-  drawBrowser();
-}
 
 // ── Touch (4-point affine calibration, NVS "cal2") ────────
 static float calA=1,calB=0,calC=0,calD=0,calE=1,calF=0;
@@ -2184,42 +2151,17 @@ static void handleSettingsTouch() {
   while (ts.touched()) { audioPumpDecode(40); delay(1); if (millis()-now>400) break; }
   // back
   if (ty<30 && tx>=170) { screenMode=SCREEN_BROWSER; drawBrowser(); return; }
-  int y=SET_ROW_Y0;
-  // invert row
-  if (ty>=y && ty<y+SET_ROW_H) { toggleInvert(); drawSettings(); return; }
-  y+=SET_ROW_H+SET_ROW_GAP;
-  // Bluetooth mode row -> reboot cleanly into Bluetooth-only mode
-  if (ty>=y && ty<y+SET_ROW_H) { btSwitchToBt(); return; }
-  y+=SET_ROW_H+SET_ROW_GAP;
-  // brightness row: - / + / tap center steps
-  if (ty>=y && ty<y+SET_ROW_H) {
-    if (tx>=158 && tx<184) { setBrightnessPct(cfgBright-10); prefs.begin(NS_CFG,false); prefs.putInt("bright",cfgBright); prefs.end(); }
-    else if (tx>=206 && tx<232) { setBrightnessPct(cfgBright+10); prefs.begin(NS_CFG,false); prefs.putInt("bright",cfgBright); prefs.end(); }
+  // rows come from SET_ROW_Y[] - the same array the drawing uses
+  if (ty>=SET_ROW_Y[SET_INVERT] && ty<SET_ROW_Y[SET_INVERT]+SET_CARD_H) { toggleInvert(); drawSettings(); return; }
+  if (ty>=SET_ROW_Y[SET_BRIGHT] && ty<SET_ROW_Y[SET_BRIGHT]+SET_CARD_H) {
+    bool changed=false;
+    if (tx>=SET_STEP_L && tx<SET_STEP_L+SET_STEP_BTN) { setBrightnessPct(cfgBright-10); changed=true; }
+    else if (tx>=SET_STEP_R && tx<SET_STEP_R+SET_STEP_BTN) { setBrightnessPct(cfgBright+10); changed=true; }
+    if (changed) { prefs.begin(NS_CFG,false); prefs.putInt("bright",cfgBright); prefs.end(); }
     drawSettings(); return;
   }
-  y+=SET_ROW_H+SET_ROW_GAP;
-  // wifi row: right side = radio toggle, left side = open scan list
-  if (ty>=y && ty<y+SET_ROW_H) {
-    if (tx>=150) {
-      setWifiRadio(!wifiRadioOn);
-      drawSettings();
-      return;
-    }
-    if (!wifiRadioOn) {
-      setWifiRadio(true);       // tapping status with radio off turns it on
-      drawSettings();
-      return;
-    }
-    wakeBackScreen=SCREEN_SETTINGS;   // back from list returns here
-    screenMode=SCREEN_WIFI_LIST;
-    wifiScroll=0;
-    startWifiScan();
-    drawWifiList();
-    return;
-  }
-  y+=SET_ROW_H+SET_ROW_GAP;
-  // recalibrate touch row
-  if (ty>=y && ty<y+SET_ROW_H) {
+  if (ty>=SET_ROW_Y[SET_BTMODE] && ty<SET_ROW_Y[SET_BTMODE]+SET_CARD_H) { btSwitchToBt(); return; }
+  if (ty>=SET_ROW_Y[SET_RECAL] && ty<SET_ROW_Y[SET_RECAL]+SET_CARD_H) {
     prefs.begin("cal2", false);
     prefs.clear();
     prefs.end();
@@ -2228,9 +2170,7 @@ static void handleSettingsTouch() {
     drawSettings();
     return;
   }
-  y+=SET_ROW_H+SET_ROW_GAP;
-  // clock row -> show idle clock screen (tap wakes back to settings)
-  if (ty>=y && ty<y+SET_ROW_H) {
+  if (ty>=SET_ROW_Y[SET_CLOCK] && ty<SET_ROW_Y[SET_CLOCK]+SET_CARD_H) {
     wakeBackScreen=SCREEN_SETTINGS;
     enterClockScreen();
     return;
@@ -2246,6 +2186,7 @@ static void handleWifiListTouch() {
   lastTouchTime=now;
   while (ts.touched()) { delay(1); if (millis()-now>400) break; }
   if (ty<30 && tx>=170) {
+    if (bootWifiPhase) { bootWifiSkip = true; return; }   // boot phase: "< skip"
     screenMode = (wakeBackScreen==SCREEN_BROWSER || wakeBackScreen==SCREEN_PLAYER)
                  ? wakeBackScreen : SCREEN_SETTINGS;
     redrawCurrentScreen();
@@ -2254,10 +2195,10 @@ static void handleWifiListTouch() {
   if (!wifiScanDone) return;
   if (ty>=290) {
     if (tx<80) { startWifiScan(); drawWifiList(); return; }       // rescan
-    if (tx>=180 && (wifiScroll+8)<wifiCount) { wifiScroll+=8; drawWifiList(); return; } // more
+    if (tx>=180 && (wifiScroll+WL_VIS)<wifiCount) { wifiScroll+=WL_VIS; drawWifiList(); return; } // more
     return;
   }
-  int idx=wifiScroll+(ty-42)/30;
+  int idx=wifiScroll+(ty-WL_Y0)/WL_ITEMH;
   if (idx<0 || idx>=wifiCount) return;
   if (!wifiLocked[idx]) {
     beginWifiConnect(wifiNames[idx], "");
@@ -2272,7 +2213,7 @@ static void handleWifiListTouch() {
   }
   kbTargetSSIDIdx=idx;
   strncpy(kbSSIDName,wifiNames[idx],32); kbSSIDName[32]='\0';
-  kbCur=0; kbPass[0]='\0'; kbShift=false;
+  kbCur=0; kbPass[0]='\0'; kbShift=false; kbShowPass=false;
   screenMode=SCREEN_KEYBOARD;
   drawKeyboard();
 }
@@ -2310,6 +2251,13 @@ static void handleKeyboardTouch() {
     }
     return;
   }
+  // header back + Show/Hide (variant B layout)
+  if (ty<30 && tx>=180) {            // < back -> WiFi list, password kept
+    screenMode=SCREEN_WIFI_LIST; drawWifiList(); return;
+  }
+  if (ty>=51 && ty<=69 && tx>=186) { // reveal / hide the password (chip inside the field)
+    kbShowPass=!kbShowPass; drawKeyboard(); return;
+  }
   if (ty<KB_Y0) return;
   int row=(ty-KB_Y0)/KB_KEY_H;
   if (row<0 || row>=KB_NROW) return;
@@ -2335,7 +2283,7 @@ static void handleBrowserTouch() {
     while (ts.touched()){ audioPumpDecode(60); if (millis()-rel>500) break; delay(1);} }
   // header: < List back OR settings
   if (ty<browseHeaderH) {
-    if (browseLevel==BROWSE_TRACKS && tx<64) { browseLevel=BROWSE_ALBUMS; browseAlbumIdx=-1; browseTrackScroll=0; drawBrowser(); return; }
+    if (browseLevel==BROWSE_TRACKS && tx<64) { browseLevel=BROWSE_ALBUMS; browseTrackScroll=0; drawBrowser(); return; }
     if (tx>=SETT_BTN_X && tx<SETT_BTN_X+SETT_BTN_W) { screenMode=SCREEN_SETTINGS; drawSettings(); return; }
     return;
   }
@@ -2373,7 +2321,6 @@ static void handleBrowserTouch() {
   tft.fillRoundRect(6,y+1,SCR_W-12,browseItemH-3,5,COL_BTN_ACT);
   { unsigned long t0=millis(); while (millis()-t0<50) audioPumpDecode(120); }
   if (browseLevel==BROWSE_ALBUMS) {
-    browseAlbumIdx=idx;
     loadBrowseAlbumTracks(albums[idx]);
     browseLevel=BROWSE_TRACKS;
     browseTrackScroll=0;
@@ -2419,7 +2366,7 @@ static void handlePlayerTouch() {
     else if (tx>=172) {
       // up: 0 -> 1 -> 2 -> 3 -> 4 -> 5 -> 10 -> 20 ...
       if      (volumePercent < 5)         volumePercent += 1;
-      else if (volumePercent == 5)        volumePercent = 10;
+      else if (volumePercent < 10)        volumePercent = 10;   // 5..9 -> 10 (boot is 9)
       else                                volumePercent = min(100, volumePercent + 10);
       applyVolumePercent(); drawVolumeControls(); prefs.begin(NS_CFG,false); prefs.putInt("vol",volumePercent); prefs.end(); return;
     }
@@ -2440,7 +2387,6 @@ static void handleTouch() {
     case SCREEN_BROWSER: handleBrowserTouch(); break;
     case SCREEN_PLAYER: handlePlayerTouch(); break;
     case SCREEN_SETTINGS: handleSettingsTouch(); break;
-    case SCREEN_BT: handleBtTouch(); break;
     case SCREEN_WIFI_LIST: handleWifiListTouch(); break;
     case SCREEN_KEYBOARD: handleKeyboardTouch(); break;
     case SCREEN_CONNECTING: break;  // wait for connect result (updateWifiConnecting handles it)
@@ -2485,6 +2431,8 @@ static void updateDisplayTimeout() {
   if (!displayBacklightOn) return;
   if (screenClockActive) return;  // clock stays until touched
   // only idle into clock from main screens; never interrupt settings/wifi/keyboard
+  // BT mode is deliberately NOT in this list (Phúc 12/9): it has no network, so
+  // the clock would show a guessed time - the BT screensavers handle its idle.
   if (screenMode != SCREEN_BROWSER && screenMode != SCREEN_PLAYER) return;
   if (millis()-lastUserActivityMs >= DISPLAY_IDLE_OFF_MS) {
     enterClockScreen();
@@ -2502,10 +2450,28 @@ static void redrawCurrentScreen() {
     case SCREEN_KEYBOARD: drawKeyboard(); break;
     case SCREEN_CONNECTING: break;
     case SCREEN_CLOCK: drawClockScreen(); break;
+    case SCREEN_SAVER_LIFE:   svDrawLifeFull();   break;
+    case SCREEN_SAVER_MATRIX: svDrawMatrixFull(); break;
   }
 }
 
 // ── Startup screen ─────────────────────────────────────────
+/** DIAGNOSTIC (temporary): name a non-power-on reset, else null. Lets the SD
+ *  auto-advance reboot identify itself on screen with no serial console. */
+static const char* lastResetReasonText() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return nullptr;           // clean boot: say nothing
+    case ESP_RST_SW:        return "RESET: sw restart";
+    case ESP_RST_PANIC:     return "RESET: PANIC (serial!)";
+    case ESP_RST_INT_WDT:   return "RESET: int WDT";
+    case ESP_RST_TASK_WDT:  return "RESET: task WDT";
+    case ESP_RST_WDT:       return "RESET: WDT";
+    case ESP_RST_BROWNOUT:  return "RESET: BROWNOUT pwr";
+    case ESP_RST_DEEPSLEEP: return "RESET: deepsleep";
+    default:                return "RESET: unknown";
+  }
+}
+
 static void drawStartupScreen() {
   tft.fillScreen(COL_BG);
   tft.setTextSize(2);
@@ -2524,6 +2490,12 @@ static void drawStartupScreen() {
   const char* v="cyd-album-v2";
   tft.setCursor((SCR_W-6*(int)strlen(v))/2,165);
   tft.print(v);
+  const char* rr = lastResetReasonText();
+  if (rr) {
+    tft.setTextColor(TFT_RED, COL_BG);
+    tft.setCursor((SCR_W-6*(int)strlen(rr))/2,182);
+    tft.print(rr);
+  }
   const char* m="Loading /music ...";
   tft.setCursor((SCR_W-6*(int)strlen(m))/2,230);
   tft.print(m);
@@ -2548,7 +2520,7 @@ static void btSwitchToBt() {   // from the SD Settings -> Bluetooth row
 }
 
 static void btSwitchToSd() {   // from the BT-only screen back button
-  // Coming back to the SD player starts at its default volume (10), not
+  // Coming back to the SD player starts at its default volume (9), not
   // the 100% that BT mode uses.
   prefs.begin(NS_CFG, false);
   prefs.putString("bootmode", "sd");
@@ -2561,17 +2533,156 @@ static void btSwitchToSd() {   // from the BT-only screen back button
   ESP.restart();
 }
 
+// ── BT screensavers (Phúc 12/9) ────────────────────────────────────────────
+// BT mode has no network, so its clock is gone; instead, after 5 min without a
+// touch the two screensavers alternate every 5 min:
+//     Conway's Game of Life  <->  Matrix digital rain (katakana)
+// A tap anywhere returns to the BT screen; the phone stream keeps playing
+// (the audio task owns core 0, this runs on core 1).
+#define SV_SWITCH_MS 300000UL          // 5 min: idle -> saver, and saver -> saver
+#define LIFE_W 60
+#define LIFE_H 80                      // full panel: 80 * 4 px = 320"
+#define LIFE_CELL 4
+#define MX_COLS 20
+#define MX_ROWS 32                     // full panel: 32 * 10 px = 320
+#define MX_PX 12
+#define MX_PY 10
+#define MX_TRAIL 12
+
+static uint8_t lifeCur[LIFE_W*LIFE_H/8];
+static uint8_t lifeNxt[LIFE_W*LIFE_H/8];
+static uint8_t mxGlyph[MX_COLS][MX_ROWS];
+static int8_t  mxHead[MX_COLS];
+static uint8_t mxLen[MX_COLS];
+static unsigned long svEnteredMs = 0;
+static unsigned long svLastFrameMs = 0;
+static uint8_t svNext = 1;             // 1 -> Life next, 2 -> Matrix next
+
+static inline void lifeSetBit(uint8_t* b, int idx, bool v) {
+  if (v) b[idx >> 3] |= (uint8_t)(1u << (idx & 7));
+  else   b[idx >> 3] &= (uint8_t)~(1u << (idx & 7));
+}
+static inline bool lifeGetBit(const uint8_t* b, int x, int y) {
+  if (x < 0) x += LIFE_W; else if (x >= LIFE_W) x -= LIFE_W;
+  if (y < 0) y += LIFE_H; else if (y >= LIFE_H) y -= LIFE_H;
+  int i = y * LIFE_W + x;
+  return (b[i >> 3] >> (i & 7)) & 1;
+}
+static inline uint16_t svLifeCol() { return tft.color565(88,190,245); }
+
+static void svDrawLifeFull() {
+  tft.fillScreen(COL_BG);
+  uint16_t col = svLifeCol();
+  for (int y = 0; y < LIFE_H; y++) {
+    for (int x = 0; x < LIFE_W; x++) {
+      if (lifeGetBit(lifeCur, x, y))
+        tft.fillRect(x*LIFE_CELL, y*LIFE_CELL, LIFE_CELL, LIFE_CELL, col);
+    }
+  }
+}
+static void svLifeSeed() {
+  memset(lifeCur, 0, sizeof(lifeCur));
+  for (int i = 0; i < LIFE_W*LIFE_H; i++) if (random(100) < 28) lifeSetBit(lifeCur, i, true);
+}
+static void svLifeStep() {
+  uint16_t col = svLifeCol();
+  for (int y = 0; y < LIFE_H; y++) {
+    for (int x = 0; x < LIFE_W; x++) {
+      int n = 0;
+      for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+          if (!dx && !dy) continue;
+          if (lifeGetBit(lifeCur, x+dx, y+dy)) n++;
+        }
+      bool alive = lifeGetBit(lifeCur, x, y);
+      bool next = (n == 3) || (alive && n == 2);
+      int i = y * LIFE_W + x;
+      bool was = (lifeCur[i >> 3] >> (i & 7)) & 1;
+      if (next != was)                      // only the cells that changed
+        tft.fillRect(x*LIFE_CELL, y*LIFE_CELL, LIFE_CELL, LIFE_CELL, next ? col : COL_BG);
+      lifeSetBit(lifeNxt, i, next);
+    }
+  }
+  memcpy(lifeCur, lifeNxt, sizeof(lifeCur));
+}
+
+static void svMatrixDrawCell(int c, int r, uint8_t level) {
+  uint16_t col = (level == 0) ? tft.color565(210,255,210)
+               : (level == 1) ? tft.color565(60,230,110)
+               : (level == 2) ? tft.color565(30,170,70)
+                              : tft.color565(18,90,38);
+  tft.drawBitmap(c*MX_PX + 2, r*MX_PY + 1, KATA8[mxGlyph[c][r]], 8, 8, col);
+}
+static void svMatrixEraseCell(int c, int r) {
+  tft.drawBitmap(c*MX_PX + 2, r*MX_PY + 1, KATA8[mxGlyph[c][r]], 8, 8, COL_BG);
+}
+static void svDrawMatrixFull() {
+  tft.fillScreen(COL_BG);
+  for (int c = 0; c < MX_COLS; c++) {
+    int h = mxHead[c];
+    for (uint8_t k = 0; k <= mxLen[c]; k++) {
+      int r = (h - (int)k + MX_ROWS) % MX_ROWS;
+      svMatrixDrawCell(c, r, k == 0 ? 0 : (k == 1 ? 1 : (k == 2 ? 2 : 3)));
+    }
+  }
+}
+static void svMatrixSeed() {
+  for (int c = 0; c < MX_COLS; c++) {
+    for (int r = 0; r < MX_ROWS; r++) mxGlyph[c][r] = (uint8_t)random(KATA8_N);
+    mxHead[c] = (int8_t)random(MX_ROWS);
+    mxLen[c] = (uint8_t)(4 + random(MX_TRAIL));
+  }
+}
+static void svMatrixStep() {
+  for (int c = 0; c < MX_COLS; c++) {
+    int h = (mxHead[c] + 1) % MX_ROWS;
+    mxHead[c] = (int8_t)h;
+    mxGlyph[c][h] = (uint8_t)random(KATA8_N);
+    svMatrixDrawCell(c, h, 0);                                    // new head
+    for (int k = 1; k <= 3; k++)                                  // the 3 fading steps
+      svMatrixDrawCell(c, (h - k + MX_ROWS) % MX_ROWS, k);
+    int e = (h - (mxLen[c] + 1) + MX_ROWS*2) % MX_ROWS;           // just fell off
+    svMatrixEraseCell(c, e);
+  }
+}
+
+static void svEnter(uint8_t which) {
+  screenMode = (which == 1) ? SCREEN_SAVER_LIFE : SCREEN_SAVER_MATRIX;
+  svEnteredMs = millis();
+  svLastFrameMs = 0;
+  if (which == 1) { svLifeSeed();   svDrawLifeFull(); }
+  else            { svMatrixSeed(); svDrawMatrixFull(); }
+}
+/** Called from loopBtMode(): BT idle -> saver, then saver -> saver every 5 min. */
+static void svIdleTick() {
+  unsigned long now = millis();
+  if (screenMode == SCREEN_BT) {
+    if (now - lastUserActivityMs >= SV_SWITCH_MS) {
+      svEnter(svNext);
+      svNext = (svNext == 1) ? 2 : 1;
+    }
+    return;
+  }
+  if (screenMode == SCREEN_SAVER_LIFE || screenMode == SCREEN_SAVER_MATRIX) {
+    if (now - svEnteredMs >= SV_SWITCH_MS) {
+      svEnter((screenMode == SCREEN_SAVER_LIFE) ? 2 : 1);
+      return;
+    }
+    unsigned long step = (screenMode == SCREEN_SAVER_LIFE) ? 220 : 90;
+    if (now - svLastFrameMs >= step) {
+      svLastFrameMs = now;
+      if (screenMode == SCREEN_SAVER_LIFE) svLifeStep();
+      else                                 svMatrixStep();
+    }
+  }
+}
+
 static void runBtModeSetup() {
   Serial.printf("[BT] boot bluetooth-only mode heap=%u\n", (unsigned)ESP.getFreeHeap());
   // BT mode always runs at full ESP gain: volume lives on the phone.
   volumePercent = 100;
   prefs.begin(NS_CFG, false); prefs.putInt("vol", 100); prefs.end();
-  SPI.begin();
-  touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
-  ts.begin(touchSPI);
-  ts.setRotation(0);
-  loadCal();
-  if (!calDone) runCalibration();
+  // display + touch init now lives in setup(): the boot WiFi phase needs it
 
   // BT mode never mounts the SD card (that ate the heap Bluedroid needs and
   // broke pairing) - it uses the PCM embedded in flash. SD files stay an
@@ -2582,18 +2693,18 @@ static void runBtModeSetup() {
   audioOut->SetPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT);
   audioOut->SetRate(44100);
   audioOut->SetChannels(2);
+  audioOut->SetUseAPLL();          // exact 44.1 kHz: no drift against the phone clock
   audioOut->begin();
   audioOut->gainNow = 0.0f;
 
   btSink.set_avrc_connection_state_callback(btAvrcConnCb);
-  btSink.set_avrc_rn_volumechange(btVolumeCb);
   btSink.set_stream_reader(btDataCb, false);
+  btSink.set_raw_stream_reader(btRawCb);     // SPEED measurement (decoded PCM)
   xTaskCreatePinnedToCore(btAudioTask, "btAudio", 4096, nullptr, 8, nullptr, 0);
   applyVolumePercent();
 
   // No WiFi is ever started in this mode -> the radio is free, start now.
   btSink.start(BT_DEVICE_NAME);
-  btStackStarted = true;
   btModeActive = true;        // audio task drains immediately
   delay(500);
   btConnected = btSink.is_connected();
@@ -2603,16 +2714,36 @@ static void runBtModeSetup() {
   btSawConnect = false;
   requestJingle(JINGLE_BOOT);
   jinglesArmed = true;
+  // The BT-only boot IS the BT screen: screenMode stayed SCREEN_BROWSER here
+  // before, so drawBtSpeedLine() early-returned (no SPEED line in BT-only
+  // mode) and the clock's wake-back would have redrawn the album browser.
+  screenMode = SCREEN_BT;
+  wakeBackScreen = SCREEN_BT;
   drawBtScreen();
+
+  // Abnormal reset? Print the reason on screen (dim red, bottom-right, font 1)
+  // so a crash/wdt/brownout is diagnosable without a serial console. Normal
+  // power-on and software resets (mode switch) draw nothing.
+  const char* rtxt = nullptr;
+  switch ((int)esp_reset_reason()) {
+    case 4:  rtxt = "PANIC";      break;
+    case 5:  rtxt = "INT_WDT";    break;
+    case 6:  rtxt = "TASK_WDT";   break;
+    case 7:  rtxt = "WDT";        break;
+    case 9:  rtxt = "BROWNOUT";   break;
+    case 14: rtxt = "PWR_GLITCH"; break;
+    case 15: rtxt = "CPU_LOCKUP"; break;
+  }
+  if (rtxt) {
+    char rbuf[24];
+    snprintf(rbuf, sizeof(rbuf), "RST:%s", rtxt);
+    tft.setTextDatum(BR_DATUM);
+    tft.setTextColor(tft.color565(150, 40, 40), COL_BG);
+    tft.drawString(rbuf, 232, 314, 1);
+    tft.setTextDatum(TL_DATUM);
+  }
 }
 
-// ESP volume buttons -> phone (AVRCP absolute volume, when the phone
-// supports it: Android/Windows yes, iOS usually keeps its own level).
-static void btNotifyPhoneVolume() {
-  if (!btStackStarted || !btConnected) return;
-  uint8_t v = (uint8_t)constrain((volumePercent * 127 + 50) / 100, 0, 127);
-  btSink.notifyVolumeToPhone(v);
-}
 
 // ESP volume/brightness steppers - ESP volume is INDEPENDENT from the
 // phone's: it drives only our own I2S gain and never notifies the phone.
@@ -2660,12 +2791,28 @@ static void btOnlyHandleTouch() {
   if (now - lastTouchTime < TOUCH_DEBOUNCE_MS) return;
   lastTouchTime = now;
   while (ts.touched()) { delay(1); if (millis() - now > 400) break; }
+  // Screensaver showing -> any tap returns to the BT screen.
+  if (screenMode == SCREEN_SAVER_LIFE || screenMode == SCREEN_SAVER_MATRIX) {
+    noteUserActivity();
+    screenMode = SCREEN_BT;
+    drawBtScreen();
+    return;
+  }
+  if (screenMode == SCREEN_CLOCK) {
+    noteUserActivity();
+    screenMode = wakeBackScreen;
+    redrawCurrentScreen();
+    return;
+  }
+  noteUserActivity();   // taps must defer the 5-min idle clock
   // header "< SD" -> clean reboot back into the SD player
   if (ty < 30 && tx >= 150) { btSwitchToSd(); return; }
   if (btHandleCtrl(tx, ty)) drawBtScreen();
 }
 
 static void loopBtMode() {
+  pollBootButton();          // BOOT button: backlight toggle
+  svIdleTick();              // 5-min idle -> Life/Matrix saver (never the clock)
   static unsigned long lastPoll = 0;
   static int lastConn = -1;      // -1 = seed from the first poll (no boot chime)
   unsigned long now = millis();
@@ -2678,12 +2825,28 @@ static void loopBtMode() {
     } else if ((c ? 1 : 0) != lastConn) {
       lastConn = c ? 1 : 0;
       btConnected = c;
-      if (!c) btStreaming = false;
+      if (c) {
+        btSuccessUntil = millis() + 5000;
+        btRateBytes = 0; btSpeedKbps = 0;
+        lastUserActivityMs = millis();
+      } else {
+        btSuccessUntil = 0;
+      }
       // safety net for the chime (requestJingle debounces the callback path)
       if (jinglesArmed) requestJingle(c ? JINGLE_CONN : JINGLE_DISC);
       Serial.printf("[BT] conn=%d heap=%u drop=%u\n", c ? 1 : 0,
                     (unsigned)ESP.getFreeHeap(), (unsigned)btDropped);
       drawBtScreen();
+    }
+  }
+  updateBtUi(now);                 // SUCCESS splash expiry, SPEED window, stats log
+  if (btUiDirty) {                 // wake requests: splash expiry, AVRCP events.
+    btUiDirty = false;             // Redraw ONLY on a real state change - a full
+    if (screenMode == SCREEN_BT) { // drawBtScreen() per wake request flashed the
+      bool splashNow = btConnected && btSuccessUntil != 0 &&   // whole screen
+                       (long)(millis() - btSuccessUntil) < 0;  // (Phúc 12/9)
+      if (splashNow != btDrawnSplash || btConnected != btDrawnConn)
+        drawBtScreen();
     }
   }
   static unsigned long lastTouchScan = 0;
@@ -2699,6 +2862,8 @@ static void runBtModeSetup();       // Bluetooth-only clean boot (fwd decl)
 static void runSdModeSetup();       // album-player boot (fwd decl)
 static void loopBtMode();           // Bluetooth-only run loop
 static void loopSdMode();           // album-player run loop
+static bool bootTimeSync();         // shared boot step (defined below setup())
+static bool bootTimeSynced = false; // set when it fetched the time
 
 void setup() {
   Serial.begin(115200);
@@ -2720,8 +2885,7 @@ void setup() {
   prefs.begin(NS_CFG, true);
   cfgInvert = prefs.getBool("invert", false);
   cfgBright = prefs.getInt("bright", 60);
-  volumePercent = prefs.getInt("vol", 10);   // SD default is 10
-  wifiRadioOn = prefs.getBool("wifiOn", true);
+  volumePercent = prefs.getInt("vol", 10);   // SD default 10 (Phúc, 12/9 - the "9" was the boot chime)
   bootModeBt = (prefs.getString("bootmode", "sd") == "bt");
   String s = prefs.getString("ssid", "");
   String p = prefs.getString("pass", "");
@@ -2732,38 +2896,147 @@ void setup() {
   applyInvert();
   setBrightnessPct(cfgBright);
 
-  // Two clean boot modes (no PSRAM: SD stack and BT stack never coexist).
-  // Switching mode = save NVS flag + ESP.restart() into a clean boot.
-  if (bootModeBt) runBtModeSetup();
-  else            runSdModeSetup();
-}
-
-static void runSdModeSetup() {
-  // SD mode always boots at its default volume (10), never the BT 100%.
-  volumePercent = 10;
-  prefs.begin(NS_CFG, false); prefs.putInt("vol", 10); prefs.end();
+  // Display + touch are common to BOTH modes, and the boot-phase WiFi UI uses
+  // them before any mode is chosen (moved up from the mode setups).
   SPI.begin();
   touchSPI.begin(TOUCH_CLK, TOUCH_MISO, TOUCH_MOSI, TOUCH_CS);
   ts.begin(touchSPI);
   ts.setRotation(0);
-
-  // Touch calibration (4-point affine, persisted). Runs once until user taps 4 targets.
   loadCal();
   if (!calDone) runCalibration();
+
+  // Two clean boot modes (no PSRAM: SD stack and BT stack never coexist).
+  // Switching mode = save NVS flag + ESP.restart() into a clean boot.
+  Serial.printf("[BOOT] reason=%d heap=%u\n", (int)esp_reset_reason(), (unsigned)ESP.getFreeHeap());
+  // BT mode NEVER touches WiFi (Phúc's call, 12/9): WiFi and BT share the same
+  // 2.4GHz controller on this board, and a BT stack started in a session that
+  // used WiFi is not discoverable (the phone just times out). Only SD boots
+  // fetch the time; BT reuses the epoch persisted by the last SD session, so
+  // its clock can drift a little - the accepted trade for a working BT.
+  if (!bootModeBt) bootTimeSynced = bootTimeSync();
+  else             Serial.println("[BT] bluetooth-only boot: WiFi untouched, clock from NVS");
+  if (bootModeBt) runBtModeSetup();
+  else            runSdModeSetup();
+}
+
+// ── Shared boot step: get the real time BEFORE the mode starts ─────────────
+// Phúc (12/9): every boot fetches the time once, so the clock is right in SD
+// *and* BT mode. With no saved network the SD WiFi UI (list + keyboard) runs
+// right here, in the boot phase, so a fresh device is configured without having
+// to enter SD mode first.
+static bool bootWifiConnectSaved() {
+  drawStartupScreen();
+  tft.setTextSize(1);
+  tft.setTextColor(colInfoCyan(), COL_BG);
+  char line[52];
+  snprintf(line, sizeof(line), "WiFi: %.20s", cfgSSID);
+  tft.setCursor((SCR_W - 6*(int)strlen(line))/2, 208);
+  tft.print(line);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.begin(cfgSSID, cfgPass);
+  unsigned long t0 = millis();
+  bool connected = false;
+  while (millis() - t0 < 12000) {
+    if (WiFi.status() == WL_CONNECTED) { connected = true; break; }
+    delay(40);
+  }
+  tft.fillRect(0, 224, SCR_W, 14, COL_BG);
+  const char* st = connected ? "Fetching time (NTP) ..." : "WiFi unreachable";
+  tft.setTextColor(connected ? colInfoCyan() : TFT_RED, COL_BG);
+  tft.setCursor((SCR_W - 6*(int)strlen(st))/2, 226);
+  tft.print(st);
+  if (connected) {
+    ntpSyncThenRadioOff(9000);
+    delay(600);                    // release the radio before any BT start
+    return true;
+  }
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  return false;
+}
+
+/** Boot-phase WiFi setup: the SD list/keyboard, driven from setup(). Returns
+ *  true once the link is up and the time has been fetched. */
+static bool bootWifiWizard() {
+  bootWifiSkip = false;
+  screenMode = SCREEN_WIFI_LIST;
+  wakeBackScreen = SCREEN_WIFI_LIST;
+  wifiScroll = 0;
+  startWifiScan();
+  drawWifiList();
+  unsigned long started = millis();
+  while (millis() - started < 180000UL) {          // never hang a boot
+    updateWifiScanResult();
+    if (WiFi.status() == WL_CONNECTED) {
+      drawStartupScreen();
+      tft.setTextSize(1);
+      tft.setTextColor(colInfoCyan(), COL_BG);
+      char l2[52];
+      snprintf(l2, sizeof(l2), "WiFi: %.20s", cfgSSID);
+      tft.setCursor((SCR_W - 6*(int)strlen(l2))/2, 208); tft.print(l2);
+      const char* st2 = "Fetching time (NTP) ...";
+      tft.setCursor((SCR_W - 6*(int)strlen(st2))/2, 226); tft.print(st2);
+      wifiConnecting = false;
+      ntpSyncThenRadioOff(9000);
+      delay(600);
+      return true;
+    }
+    if (wifiConnecting && millis() - wifiConnStart > 12000) {
+      wifiConnecting = false;
+      WiFi.disconnect();
+      screenMode = SCREEN_WIFI_LIST;
+      startWifiScan();
+      drawWifiList();
+    }
+    if (ts.touched()) {
+      if (screenMode == SCREEN_WIFI_LIST) handleWifiListTouch();
+      else if (screenMode == SCREEN_KEYBOARD) handleKeyboardTouch();
+      if (bootWifiSkip) return false;
+    }
+    delay(12);
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+static bool bootTimeSync() {
+  bool connected;
+  if (cfgSSID[0]) {
+    connected = bootWifiConnectSaved();
+  } else {
+    bootWifiPhase = true;
+    connected = bootWifiWizard();
+    bootWifiPhase = false;
+  }
+  Serial.printf("[BOOT] wifi=%d epoch=%ld\n", connected ? 1 : 0, (long)time(nullptr));
+  return connected;
+}
+
+static void runSdModeSetup() {
+  // SD mode always boots at its default volume (9, Phúc 12/9), never the
+  // BT 100%.
+  volumePercent = 10;
+  prefs.begin(NS_CFG, false); prefs.putInt("vol", 10); prefs.end();
+  // display + touch init now lives in setup(): the boot WiFi phase needs it
 
   // audio out (I2S -> MAX98357A)
   audioOut = new I2SOutTap();
   audioOut->SetPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT);
   audioOut->SetRate(44100);
   audioOut->SetChannels(2);
+  // SetUseAPLL() REMOVED for SD playback (12/9): it was the only functional
+  // change on the SD path when "one track ends -> board reboots" appeared,
+  // so this build bisects it. Re-add only once the reboot is proven
+  // unrelated AND exact 44.1 kHz is wanted here.
   audioOut->begin();
   audioOut->gainNow = 0.0f;
 
   // Bluetooth sink callbacks - registered once, the stack is only started
   // (never restarted) the first time the user opens Bluetooth mode.
   btSink.set_avrc_connection_state_callback(btAvrcConnCb);
-  btSink.set_avrc_rn_volumechange(btVolumeCb);
   btSink.set_stream_reader(btDataCb, false);
+  btSink.set_raw_stream_reader(btRawCb);     // SPEED measurement (decoded PCM)
 
   // dedicated BT->I2S writer on core 0 (proven drop-free in the standalone
   // test): keeps the BT stream fed regardless of what core 1 is doing
@@ -2789,9 +3062,8 @@ static void runSdModeSetup() {
   // itself off. If there is no saved network or it fails, the scan list
   // opens so the user can pick & type a network.
   bool haveSaved = cfgSSID[0];
-  bool connected = false;
-  if (haveSaved) {
-    wifiRadioOn = true;
+  bool connected = bootTimeSynced;   // shared boot step already did it
+  if (haveSaved && !bootTimeSynced) {
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
     WiFi.begin(cfgSSID, cfgPass);
@@ -2801,14 +3073,27 @@ static void runSdModeSetup() {
       delay(40);
     }
     if (!connected) WiFi.disconnect();
-  } else {
-    // radio init now; the scan list below does the actual scan
-    wifiRadioOn = true;
+  } else if (!haveSaved) {
+    // No saved network: init the radio here for the scan list below.
+    // NOTE: this branch must be gated on !haveSaved too. With the boot-phase
+    // sync in place, `haveSaved && bootTimeSynced` also lands in the else, and
+    // WiFi.mode(WIFI_STA)+setSleep(false) then re-awakened the radio the boot
+    // phase had just powered off - the radio stayed awake through SD playback
+    // (extra current on a board that browns out easily, plus RF bursts over the
+    // SD card and I2S), which showed up as "SD mode won't play + screen
+    // flickering". The radio must stay OFF after the boot sync.
     WiFi.mode(WIFI_STA);
     WiFi.setSleep(false);
   }
-  if (connected) {
+  if (connected && !bootTimeSynced) {
     ntpSyncThenRadioOff(6000);   // get time + timezone, then radio off
+  }
+  if (bootTimeSynced) {
+    // Belt & braces before playback: the boot phase already fetched the time,
+    // so the radio MUST be down here (never awake while the amp + SD card run).
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    wifiScanDone = true;
   }
 
   scanSD();
@@ -2821,7 +3106,6 @@ static void runSdModeSetup() {
   }
   scanAlbums();
   browseLevel=BROWSE_ALBUMS;
-  browseAlbumIdx=-1;
   browseTrackScroll=0;
   albumScroll=0;
   if (connected) {
@@ -2841,7 +3125,6 @@ static void runSdModeSetup() {
   }
 
   lastUserActivityMs=millis();
-  mainUiReady=true;
 }
 
 static void loopSdMode() {
@@ -2849,18 +3132,6 @@ static void loopSdMode() {
   updateDisplayTimeout();
   updateWifiScanResult();
   updateWifiConnecting();
-  // radio turned back on with saved network: re-sync clock quietly once connected
-  if (wifiNeedNtp && WiFi.status()==WL_CONNECTED) {
-    wifiNeedNtp = false;
-    startNtp();
-  }
-
-  // Bluetooth mode: poll link state, redraw on change (audio is drained by
-  // the dedicated core-0 btAudioTask started in setup())
-  if (btModeActive) {
-    updateBtPoll();
-    if (btUiDirty) drawBtScreen();
-  }
 
   if (clockForceRedraw && screenMode==SCREEN_CLOCK) drawClockScreen();
 
@@ -2918,6 +3189,7 @@ static void loopSdMode() {
     if (!runningNow) {
       // decoder finished -> advance after short silent gap (pop-safe)
       if (trackCount>0 && allowAutoAdvance()) {
+        Serial.printf("[ADV] eof track=%d heap=%u\n", currentTrack, (unsigned)ESP.getFreeHeap());
         pumpSilence(32);
         nextTrack(true);
         if (screenMode==SCREEN_PLAYER && displayBacklightOn) drawPlayer();
