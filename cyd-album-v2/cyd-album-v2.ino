@@ -24,6 +24,7 @@
 #define A2DP_SPP_SUPPORT 0        // free ~20-40KB: no serial-port-profile needed
 #include <BluetoothA2DPSink.h>
 #include <esp_avrc_api.h>
+#include <esp_sntp.h>          // sntp_set_time_sync_notification_cb (real sync check)
 // Chimes embedded in flash (~752 KB of PCM). Build with
 // -DJINGLE_NO_EMBED for a ~750 KB smaller image: the /sounds/*.wav files on
 // the SD card then become the only source of the custom chimes (BT mode,
@@ -1073,9 +1074,18 @@ static time_t clockNow() {
   long ep = prefs.getLong("epoch", 0);
   unsigned long savedMs = prefs.getULong("epms", 0);
   prefs.end();
+  // savedMs belongs to the session that persisted it, so the uptime delta is
+  // only valid while millis() has NOT wrapped past it (same session). On a fresh
+  // boot millis() < savedMs, and the unsigned subtraction used to underflow into
+  // a ~49.7-day jump: the clock showed a date ~50 days in the future whenever
+  // NTP failed (looks like "no timezone"). Fall back to the saved epoch.
   if (ep >= 1600000000) {
-    time_t est = (time_t)ep + (time_t)((millis() - savedMs) / 1000ul);
-    if (est >= 1600000000) return est;
+    unsigned long up = millis();
+    if (up >= savedMs) {
+      time_t est = (time_t)ep + (time_t)((up - savedMs) / 1000ul);
+      if (est >= 1600000000) return est;
+    }
+    return (time_t)ep;            // last known time (device was off an unknown while)
   }
   return 0;
 }
@@ -1121,6 +1131,16 @@ static void drawClockScreen() {
     tft.setTextColor(COL_DIM,COL_BG);
     tft.setCursor((SCR_W-(int)strlen(m)*6)/2, 180);
     tft.print(m);
+  }
+  // which zone the time is in + whether this boot really reached an NTP server
+  tft.setTextSize(1);
+  {
+    bool ok = valid && time(nullptr) >= 1600000000;
+    char z[32];
+    snprintf(z, sizeof(z), "GMT+7 - NTP %s", ok ? "ok" : "fail");
+    tft.setTextColor(ok ? COL_DIM : TFT_RED, COL_BG);
+    tft.setCursor((SCR_W-(int)strlen(z)*6)/2, 258);
+    tft.print(z);
   }
   const char* hint="tap to wake";
   tft.setTextSize(1);
@@ -1262,6 +1282,10 @@ static void startWifiScan() {
 }
 
 // forward decl (defined below with the wifi-connect block)
+// Vietnam: UTC+7, no DST. POSIX TZ string - the sign is INVERTED on purpose
+// (POSIX counts west-positive), so zone "+07" carries offset -7.
+#define TZ_INFO "<+07>-7"
+
 static bool wifiConnecting=false;
 
 static void updateWifiScanResult() {
@@ -1478,23 +1502,43 @@ static void saveWifiCreds(const char* ssid, const char* pass) {
 }
 
 
+static volatile bool sntpSynced = false;
+static void sntpNotifyCb(struct timeval*) { sntpSynced = true; }
+
 static void startNtp() {
-  configTime(7*3600, 0, "pool.ntp.org", "time.nist.gov");
+  sntpSynced = false;
+  sntp_set_time_sync_notification_cb(sntpNotifyCb);
+  // NEVER use configTime(offset, 0, ...) here. The core's configTime() calls
+  // setTimeZone(-offset, daylight), which appends a DST rule whenever
+  // daylightOffset != 3600 - our old call produced the malformed TZ string
+  // "UTC-7DST-7", tzset() failed and localtime() silently stayed on UTC, so the
+  // clock read 7 h behind (Phúc 12/9: "kết nối được wifi nhưng không lấy time
+  // zone"). configTzTime() sets a real POSIX TZ string instead.
+  configTzTime(TZ_INFO, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
 }
 
 // Boot rule: WiFi is only used to fetch the time. Once NTP has answered
 // (or a timeout passes) the radio is powered fully off again.
-static void ntpSyncThenRadioOff(unsigned long maxWaitMs) {
-  startNtp();
-  unsigned long t0 = millis();
-  time_t now = time(nullptr);
-  while (millis()-t0 < maxWaitMs && now < 1700000000L) { delay(40); now = time(nullptr); }
-  delay(120);                       // let configTime settle one tick
-  if (now >= 1700000000L) clockPersist();  // save epoch so clock survives reboot
+/** Sync the clock, then release the radio. Returns true only when a real SNTP
+ *  response arrived - the old check compared time() against a fixed threshold,
+ *  which a STALE persisted epoch also passes. Retries once: NTP/DNS hiccups
+ *  right after association are common. */
+static bool ntpSyncThenRadioOff(unsigned long maxWaitMs) {
+  bool ok = false;
+  for (int attempt = 1; attempt <= 2 && !ok; attempt++) {
+    startNtp();
+    unsigned long t0 = millis();
+    while (!sntpSynced && millis() - t0 < maxWaitMs) delay(40);
+    ok = sntpSynced;
+    Serial.printf("[NTP] attempt %d -> %s (epoch=%ld)\n", attempt, ok ? "ok" : "fail",
+                  (long)time(nullptr));
+  }
+  if (ok) { delay(120); clockPersist(); }   // only persist a verified time
   WiFi.disconnect(true);
   WiFi.mode(WIFI_OFF);
   wifiConnecting = false;
   wifiScanDone = true;
+  return ok;
 }
 
 static void beginWifiConnect(const char* ssid, const char* pass) {
@@ -2948,8 +2992,13 @@ static bool bootWifiConnectSaved() {
   tft.setCursor((SCR_W - 6*(int)strlen(st))/2, 226);
   tft.print(st);
   if (connected) {
-    ntpSyncThenRadioOff(9000);
-    delay(600);                    // release the radio before any BT start
+    bool synced = ntpSyncThenRadioOff(9000);
+    tft.fillRect(0, 224, SCR_W, 14, COL_BG);
+    const char* r = synced ? "Time OK (GMT+7)" : "WiFi ok - no NTP reply";
+    tft.setTextColor(synced ? colInfoCyan() : TFT_RED, COL_BG);
+    tft.setCursor((SCR_W - 6*(int)strlen(r))/2, 226);
+    tft.print(r);
+    delay(900);                    // release the radio before any BT start
     return true;
   }
   WiFi.disconnect(true);
@@ -2976,11 +3025,16 @@ static bool bootWifiWizard() {
       char l2[52];
       snprintf(l2, sizeof(l2), "WiFi: %.20s", cfgSSID);
       tft.setCursor((SCR_W - 6*(int)strlen(l2))/2, 208); tft.print(l2);
+      wifiConnecting = false;
       const char* st2 = "Fetching time (NTP) ...";
       tft.setCursor((SCR_W - 6*(int)strlen(st2))/2, 226); tft.print(st2);
-      wifiConnecting = false;
-      ntpSyncThenRadioOff(9000);
-      delay(600);
+      bool synced2 = ntpSyncThenRadioOff(9000);
+      tft.fillRect(0, 224, SCR_W, 14, COL_BG);
+      const char* r2 = synced2 ? "Time OK (GMT+7)" : "WiFi ok - no NTP reply";
+      tft.setTextColor(synced2 ? colInfoCyan() : TFT_RED, COL_BG);
+      tft.setCursor((SCR_W - 6*(int)strlen(r2))/2, 226);
+      tft.print(r2);
+      delay(900);
       return true;
     }
     if (wifiConnecting && millis() - wifiConnStart > 12000) {
