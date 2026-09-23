@@ -1960,10 +1960,10 @@ static void playJingleTask(int idx) {
     fr[0] = fr[1] = s;
     int tries = 0;
     while (!audioOut->ConsumeSample(fr)) { vTaskDelay(1); if (++tries > 500) break; }
-    if ((jOutIdx & 0x3FF) == 0) vTaskDelay(1);   // let the BT stack run
   }
   audioOut->jingleMode = false;
   jWavStop();
+  pumpSilence(96);
   btRingR = btRingW;      // phone frames buffered during the chime are stale
 }
 
@@ -1983,15 +1983,27 @@ static void btAvrcConnCb(bool connected) {
 }
 
 // Bluetooth GAP callback hook: auto-confirms pairing requests from PC/Windows
+static volatile uint32_t btPairingPin = 0;
+static volatile bool btPairingActive = false;
+static volatile unsigned long btPairingActiveMs = 0;
+
 static void btCustomGapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
   switch (event) {
     case ESP_BT_GAP_CFM_REQ_EVT:
-      Serial.printf("[BT-GAP] SSP numeric comparison passkey=%u -> auto-confirm\n",
+      Serial.printf("[BT-GAP] SSP numeric comparison passkey=%06u -> auto-confirm\n",
                     (unsigned)param->cfm_req.num_val);
+      btPairingPin = param->cfm_req.num_val;
+      btPairingActive = true;
+      btPairingActiveMs = millis();
       esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+      btUiWake();
       break;
     case ESP_BT_GAP_KEY_NOTIF_EVT:
-      Serial.printf("[BT-GAP] SSP passkey notif=%u\n", (unsigned)param->key_notif.passkey);
+      Serial.printf("[BT-GAP] SSP passkey notif=%06u\n", (unsigned)param->key_notif.passkey);
+      btPairingPin = param->key_notif.passkey;
+      btPairingActive = true;
+      btPairingActiveMs = millis();
+      btUiWake();
       break;
     case ESP_BT_GAP_KEY_REQ_EVT:
       Serial.println("[BT-GAP] SSP passkey request -> reply 0");
@@ -1999,16 +2011,23 @@ static void btCustomGapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param
       break;
     case ESP_BT_GAP_PIN_REQ_EVT: {
       Serial.println("[BT-GAP] Legacy PIN request -> reply 1234");
+      btPairingPin = 1234;
+      btPairingActive = true;
+      btPairingActiveMs = millis();
       esp_bt_pin_code_t pin = {'1', '2', '3', '4'};
       esp_bt_gap_pin_reply(param->pin_req.bda, true, 4, pin);
+      btUiWake();
       break;
     }
     case ESP_BT_GAP_AUTH_CMPL_EVT:
       if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
         Serial.printf("[BT-GAP] Auth success with '%s'\n", param->auth_cmpl.device_name);
+        btPairingActive = false;
       } else {
         Serial.printf("[BT-GAP] Auth failed, status=%d\n", param->auth_cmpl.stat);
+        btPairingActive = false;
       }
+      btUiWake();
       break;
     default:
       break;
@@ -2224,7 +2243,15 @@ static void drawBtScreen() {
       // no SPEED line while unlinked - clear the band once (the line repaints
       // in place without clearing, so a stale reading must never stay behind)
       tft.fillRect(0, 129, SCR_W, 12, COL_BG);
-      btCenterLine("waiting for phone ...", 100, 1, COL_DIM, COL_BG);
+      if (btPairingActive && (millis() - btPairingActiveMs < 20000)) {
+        char pbuf[32];
+        snprintf(pbuf, sizeof(pbuf), "PIN: %06u", (unsigned)btPairingPin);
+        btCenterLine("Pairing with PC...", 92, 1, TFT_YELLOW, COL_BG);
+        btCenterLine(pbuf, 108, 2, colInfoCyan(), COL_BG);
+      } else {
+        btCenterLine("waiting for phone / PC ...", 92, 1, COL_DIM, COL_BG);
+        btCenterLine("Pairing PIN: 1234", 108, 1, colInfoCyan(), COL_BG);
+      }
     }
   }
 
@@ -3427,6 +3454,16 @@ static void runBtModeSetup() {
   esp_err_t codErr = esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
   Serial.printf("[BT] Set Class of Device (Loudspeaker 0x240414): %d\n", (int)codErr);
 
+  // Security parameters: DisplayYesNo so Windows 10/11 & phones show pairing PIN
+  esp_bt_sp_param_t param_type = ESP_BT_SP_IOCAP_MODE;
+  esp_bt_io_cap_t iocap = ESP_BT_IO_CAP_IO;    // DisplayYesNo: device has display to confirm PIN
+  esp_bt_gap_set_security_param(param_type, &iocap, sizeof(uint8_t));
+
+  // Legacy fixed PIN: 1234 (when Windows prompts user for a PIN)
+  esp_bt_pin_type_t pin_type = ESP_BT_PIN_TYPE_FIXED;
+  esp_bt_pin_code_t pin_code = {'1', '2', '3', '4'};
+  esp_bt_gap_set_pin(pin_type, 4, pin_code);
+
   // Hook GAP callback to auto-confirm Windows/PC SSP pairing & PIN requests
   esp_bt_gap_register_callback(btCustomGapCallback);
   esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
@@ -3643,7 +3680,7 @@ void setup() {
   cfgInvert = prefs.getBool("invert", false);
   cfgBright = prefs.getInt("bright", 60);
   volumePercent = prefs.getInt("vol", 10);   // SD default 10 (Phúc, 12/9 - the "9" was the boot chime)
-  bootModeBt = (prefs.getString("bootmode", "sd") == "bt");
+  bootModeBt = (prefs.getString("bootmode", "bt") == "bt");
   cfgAutoBright = prefs.getBool("autob", false);   // ambient-light auto brightness
   String s = prefs.getString("ssid", "");
   String p = prefs.getString("pass", "");
@@ -3853,6 +3890,15 @@ static void drawSdWaitScreen(int attempts) {
   tft.print(t7);
   tft.setCursor((SCR_W - 6 * (int)strlen(t8)) / 2, 216);
   tft.print(t8);
+
+  // Button to switch to Bluetooth mode so user is never trapped without SD
+  tft.fillRoundRect(20, 245, SCR_W - 40, 36, 6, COL_BTN);
+  tft.drawRoundRect(20, 245, SCR_W - 40, 36, 6, colInfoCyan());
+  tft.setTextSize(1);
+  tft.setTextColor(colInfoCyan(), COL_BTN);
+  const char* btt = "Chuyen sang Bluetooth";
+  tft.setCursor((SCR_W - 6 * (int)strlen(btt)) / 2, 258);
+  tft.print(btt);
 }
 
 // Vao day khi mount that bai; chi return khi da mount duoc -> flow boot tiep tuc
@@ -3865,6 +3911,10 @@ static void sdWaitUntilMounted() {
     pollBootButton();
     int16_t tx, ty;
     bool tapped = displayBacklightOn && getTouchXY(tx, ty);
+    if (tapped && tx >= 20 && tx <= (SCR_W - 20) && ty >= 240 && ty <= 290) {
+      btSwitchToBt();
+      return;
+    }
     bool autoDue = (millis() - lastTry) > 5000UL;
     if ((tapped && (millis() - lastTry) > 800UL) || autoDue) {
       lastTry = millis();
@@ -3898,17 +3948,22 @@ static void runSdModeSetup() {
   prefs.begin(NS_CFG, false); prefs.putInt("vol", 10); prefs.end();
   // display + touch init now lives in setup(): the boot WiFi phase needs it
 
-  // audio out (I2S -> MAX98357A)
+  // SD must be mounted before starting audio & startup chime
+  if (!sdMountSmart()) {
+    sdWaitUntilMounted();
+  }
+  Serial.printf("[SD] mount step=%d freq=%lu Hz\n", sdMountStep,
+                (unsigned long)(sdMountStep >= 0 ? SD_MOUNT_FREQS[sdMountStep] : 0));
+  sdReady = true;                    // /sounds/*.wav may be used from here on
+
+  // audio out (I2S -> MAX98357A): start I2S right before playing audio (no underruns during mount)
   audioOut = new I2SOutTap();
   audioOut->SetPinout(I2S_BCLK, I2S_LRCK, I2S_DOUT);
   audioOut->SetRate(44100);
   audioOut->SetChannels(2);
-  // SetUseAPLL() REMOVED for SD playback (12/9): it was the only functional
-  // change on the SD path when "one track ends -> board reboots" appeared,
-  // so this build bisects it. Re-add only once the reboot is proven
-  // unrelated AND exact 44.1 kHz is wanted here.
   audioOut->begin();
   audioOut->gainNow = 0.0f;
+  pumpSilence(128);
 
   // Bluetooth sink callbacks - registered once, the stack is only started
   // (never restarted) the first time the user opens Bluetooth mode.
@@ -3922,16 +3977,6 @@ static void runSdModeSetup() {
   xTaskCreatePinnedToCore(btAudioTask, "btAudio", 6144, nullptr, 8, nullptr, 0);
   applyVolumePercent();
 
-  // SD must be mounted before the startup chime: /sounds/boot.wav is the
-  // preferred source, the built-in procedural chime is the fallback.
-  // SD mount: thu lan luot nhieu muc toc do SPI; neu that bai thi hien man hinh
-  // chan doan + cho phep cham man hinh / tu dong thu lai (KHONG treo cung nhu ban cu).
-  if (!sdMountSmart()) {
-    sdWaitUntilMounted();
-  }
-  Serial.printf("[SD] mount step=%d freq=%lu Hz\n", sdMountStep,
-                (unsigned long)(sdMountStep >= 0 ? SD_MOUNT_FREQS[sdMountStep] : 0));
-  sdReady = true;                    // /sounds/*.wav may be used from here on
   playJingleBlocking(JINGLE_BOOT);   // startup chime (fixed 20% gain)
 
   drawStartupScreen();
