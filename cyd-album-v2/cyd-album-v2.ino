@@ -73,15 +73,43 @@ class BtSink : public BluetoothA2DPSink {
  public:
   void notifyVolumeToPhone(uint8_t vol) { volume_set_by_local_host(vol); }
   // Pin the lib's per-frame scaling to full (no AVRCP notify to the phone).
+  /** The library's own volume stage is a per-sample multiply + clip executed
+   *  INSIDE the Bluetooth callback (48 000 frames/s at 48 kHz) — pure overhead in
+   *  the most latency-critical task on this board, and our I2SOutTap already owns
+   *  the gain. Pin the factor to full and DISABLE the stage: with
+   *  is_volume_used == false (and no mono downmix) update_audio_data() returns
+   *  immediately and the samples reach our ring untouched. */
   void pinVolumeFull() {
     A2DPVolumeControl *vc = volume_control();
-    vc->set_volume(127);
-    vc->set_enabled(true);
+    vc->set_volume(127);      // factor stays at full should anything re-enable it
+    vc->set_enabled(false);   // no per-sample work, no double scaling
+  }
+  void forwardGapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
+    app_gap_callback(event, param);
   }
 };
 #define DISP_ROTATION 0        // changed 2->0 per user: reverse orientation
 static bool cfgInvert = false;
 static int  cfgBright = 60;    // 0..100
+// ── Ambient light sensor: LDR on GPIO34 (ADC1_CH6, input-only) ─────────────
+// Auto brightness reads the same LDR the ldr-test build measures. Two raw-ADC
+// calibration points: a bright room reads LOW, the dark reads HIGH on this
+// board's divider (verified with ldr-test), so brightness falls as raw rises.
+#define LDR_PIN        34
+#define LDR_BRIGHT_ADC 200     // raw ADC in a bright room
+#define LDR_DARK_ADC   1700    // raw ADC in the dark
+#define AUTO_MIN_PCT   15      // never dim past this: the screen must stay readable
+// Phúc 14/9: "auto bright nhạy sáng quá". Tuned for a relaxed response:
+// 12 % deadband, 12 s between adjustments (4 s only for a huge jump such as
+// turning the room light on/off), +12 s (not 3 s) and a slower EMA.
+#define AUTO_STEP_MINPCT 12    // hysteresis: ignore changes smaller than this
+#define AUTO_STEP_MS   12000   // ...and never adjust more often than this
+#define AUTO_STEP_FAST_MS 4000 // a >=35 % jump may act sooner
+#define AUTO_SAMPLE_MS 400     // sample period (the LDR itself is slow)
+static bool cfgAutoBright = false;   // NVS "autob"
+static int  ldrRaw = -1;             // EMA of the raw ADC (-1 = no sample yet)
+static unsigned long lastAutoMs = 0;
+static bool briUiDirty = false;      // consumed by the loops (settings/BT %) 
 static char cfgSSID[33] = "";
 static char cfgPass[65] = "";
 
@@ -190,6 +218,56 @@ void displaySetOn(bool on) {
   }
 }
 
+// ── Auto brightness (LDR on GPIO34) ────────────────────────
+// Calibration point read = bright room, dark = high raw (see LDR_*_ADC).
+static inline int ldrToPct(int raw) {
+  if (raw <= LDR_BRIGHT_ADC) return 100;
+  if (raw >= LDR_DARK_ADC)   return AUTO_MIN_PCT;
+  int span = LDR_DARK_ADC - LDR_BRIGHT_ADC;             // 1500
+  int pct  = 100 - (int)(((long)(raw - LDR_BRIGHT_ADC) * (100 - AUTO_MIN_PCT)) / span);
+  return constrain(pct, AUTO_MIN_PCT, 100);
+}
+
+/** Manual -/+ wins over auto: called from every brightness stepper.
+ *  Persists because the auto flag is a user setting, not a mode. */
+static void autoBrightDisable() {
+  if (!cfgAutoBright) return;
+  cfgAutoBright = false;
+  prefs.begin(NS_CFG, false); prefs.putBool("autob", false); prefs.end();
+}
+
+/** Sample the LDR, average, and (when auto is on) drive the backlight.
+ *  Hysteresis + rate limit so the panel never flickers while the light
+ *  drifts. Called from BOTH run loops. */
+static void autoBrightTick() {
+  static unsigned long lastSample = 0;
+  static int        lastWant = -1;
+  static uint8_t    stableCnt = 0;
+  if (!cfgAutoBright) { ldrRaw = -1; lastWant = -1; stableCnt = 0; return; }
+  unsigned long now = millis();
+  if (now - lastSample < AUTO_SAMPLE_MS) return;
+  lastSample = now;
+  uint32_t acc = 0;
+  for (int i = 0; i < 10; i++) acc += analogRead(LDR_PIN);   // 10 samples per tick
+  int raw = (int)(acc / 10);
+  if (ldrRaw < 0) ldrRaw = raw;
+  else            ldrRaw += (raw - ldrRaw) / 10;            // slow EMA (tau ~4 s)
+  int want = ldrToPct(ldrRaw);
+  // A reading only counts once it has settled: a passing shadow or the phone's
+  // own screen used to yank the brightness around.
+  if (lastWant >= 0 && abs(want - lastWant) <= 4) { if (stableCnt < 3) stableCnt++; }
+  else stableCnt = 0;
+  lastWant = want;
+  if (stableCnt < 2) return;
+  int diff = abs(want - cfgBright);
+  if (diff < AUTO_STEP_MINPCT) return;
+  unsigned long need = (diff >= 35) ? AUTO_STEP_FAST_MS : AUTO_STEP_MS;
+  if (now - lastAutoMs < need) return;
+  lastAutoMs = now;
+  setBrightnessPct(want);       // NOT persisted: the boot value stays the manual one
+  briUiDirty = true;            // the owning loop repaints the % readout
+}
+
 // ── Invert display (runtime, NVS-persisted) ────────────────
 void applyInvert() {
   tft.invertDisplay(cfgInvert);
@@ -223,6 +301,14 @@ public:
   bool fading = false;
   bool mutePending = false;
   bool jingleMode = false;  // true while a boot/connect chime plays (fixed gain)
+
+  /** APLL exists to nail the 44.1 kHz family exactly. For a 48 kHz source
+   *  (Linux/BlueZ) it must be DROPPED: the APLL clock reconfig for 48 kHz can
+   *  fail, and AudioOutputI2S::SetRate() ignores that error -> the I2S stays on
+   *  the old clock and the incoming stream keeps overrunning (constant
+   *  break-up). 48 kHz is exact off the default PLL anyway. `_useAPLL` is
+   *  protected in the base class, so a subclass setter is the only clean way. */
+  void SetApllForRate(int hz) { _useAPLL = ((hz % 44100) == 0); }
 
   bool ConsumeSample(int16_t sample[2]) override {
     // fade toward target (a chime ignores the fade: it has its own gain)
@@ -828,10 +914,14 @@ static void drawTitleCentered(int y, int maxPx, const char* s) {
 enum ScreenMode { SCREEN_BROWSER, SCREEN_PLAYER, SCREEN_SETTINGS,
                   SCREEN_WIFI_LIST, SCREEN_KEYBOARD, SCREEN_CONNECTING, SCREEN_CLOCK,
                   SCREEN_BT,
-                  // BT-mode screensavers (Phúc 12/9): BT has no network, so no
-                  // clock - these two alternate every 5 min of idle instead.
-                  SCREEN_SAVER_LIFE, SCREEN_SAVER_MATRIX };
+                  // BT-mode screensavers (Phúc 14/9): BT has no network so it still
+                  // has NO clock; these FIVE faces cycle instead (tap = next face).
+                  SCREEN_SAVER_LIFE, SCREEN_SAVER_MATRIX,
+                  SCREEN_SAVER_METEOR, SCREEN_SAVER_TETRIS };
 static ScreenMode screenMode = SCREEN_BROWSER;
+static inline bool isSaverScreen() {
+  return screenMode >= SCREEN_SAVER_LIFE && screenMode <= SCREEN_SAVER_TETRIS;
+}
 // remember the screen showing before idle clock, to wake back to it
 static ScreenMode wakeBackScreen = SCREEN_PLAYER;
 
@@ -1185,6 +1275,34 @@ static const int SET_ROW_Y[SET_NROWS] = {48, 86, 142, 198, 236};  // card tops
 static const int SET_GRP_Y[3] = {37, 131, 187};                   // DISPLAY / MODE / SYSTEM
 static const int SET_PILL_X=170, SET_PILL_W=50, SET_PILL_H=24;   // ON/OFF pill
 static const int SET_STEP_L=145, SET_STEP_R=201, SET_STEP_BTN=22;  // - / value / + (in-card chips)
+// AUTO pill on the Brightness card: sits between the label and the stepper,
+// one frame only (the card), same idiom as the invert pill.
+static const int SET_AUTO_X=86, SET_AUTO_W=50;
+static const int SET_PCT_X=172;                                  // fixed-width % field
+static inline uint16_t colAutoOn()  { return tft.color565(88,190,245); }
+static inline uint16_t colAutoOff() { return tft.color565(70,70,70); }
+
+/** Repaints ONLY the brightness % readout (fixed 4-char field, opaque text ->
+ *  no band clear, no flicker). Used by drawSettings() and by the auto-brightness
+ *  dirty consumer in the run loop. */
+static void drawSetBrightPct() {
+  char b[8]; snprintf(b, sizeof(b), "%3d%%", cfgBright);
+  tft.setTextSize(1);
+  tft.setTextColor(COL_TEXT, COL_BTN);
+  tft.setCursor(SET_PCT_X, SET_ROW_Y[SET_BRIGHT]+14);
+  tft.print(b);
+}
+
+/** Repaints ONLY the AUTO chip on the Brightness card. */
+static void drawSetAutoPill() {
+  int y=SET_ROW_Y[SET_BRIGHT];
+  uint16_t col = cfgAutoBright ? colAutoOn() : colAutoOff();
+  tft.fillRoundRect(SET_AUTO_X,y+5,SET_AUTO_W,SET_PILL_H,12,col);
+  tft.setTextSize(1);
+  tft.setTextColor(cfgAutoBright?COL_BG:tft.color565(200,200,205),col);
+  tft.setCursor(SET_AUTO_X+((SET_AUTO_W-4*6)/2),y+14);
+  tft.print("AUTO");
+}
 static inline uint16_t setEdge()  { return tft.color565(38,38,44); }
 static inline uint16_t setCtrlBg(){ return tft.color565(45,45,52); }
 static void drawSettings() {
@@ -1222,13 +1340,12 @@ static void drawSettings() {
     tft.setCursor(SET_PILL_X+((SET_PILL_W-6*(cfgInvert?2:3))/2),y+14);
     tft.print(cfgInvert?"ON":"OFF");
   }
-  // brightness stepper - two 22x22 chips INSIDE the card (one frame only)
+  // brightness card: AUTO chip + two 22x22 stepper chips (one frame only)
   { int y=SET_ROW_Y[SET_BRIGHT];
+    drawSetAutoPill();
     tft.fillRoundRect(SET_STEP_L,y+6,SET_STEP_BTN,SET_STEP_BTN,5,setCtrlBg());
     tft.setTextColor(COL_TEXT,setCtrlBg()); tft.setCursor(SET_STEP_L+8,y+13); tft.print("-");
-    char b[8]; snprintf(b,sizeof(b),"%d%%",cfgBright);
-    tft.setTextColor(COL_TEXT,COL_BTN);
-    tft.setCursor(184-3*(int)strlen(b),y+14); tft.print(b);
+    drawSetBrightPct();
     tft.fillRoundRect(SET_STEP_R,y+6,SET_STEP_BTN,SET_STEP_BTN,5,setCtrlBg());
     tft.setTextColor(COL_TEXT,setCtrlBg()); tft.setCursor(SET_STEP_R+8,y+13); tft.print("+");
   }
@@ -1587,6 +1704,12 @@ static volatile uint32_t btRingW = 0, btRingR = 0;
 static volatile uint32_t btDropped = 0;
 
 static int16_t btChunk[1024 * 2];    // audio task transfers in big chunks
+// Source-negotiated sample rate. Linux/BlueZ picks 48 kHz SBC while phones usually
+// use 44.1 kHz; with the I2S pinned at 44.1 kHz the ring overran continuously ->
+// constant break-up. Recorded in the BT callback, applied by the AUDIO TASK (it is
+// the only writer of the I2S channel and of btRingR).
+static volatile uint16_t btReqRate = 0;
+static uint16_t btActiveRate = 44100;      // I2S rate currently applied (log only)
 
 // ═══════════════════════════════════════════════════════════
 // Jingles — boot / phone-connect / phone-disconnect chimes
@@ -1859,6 +1982,40 @@ static void btAvrcConnCb(bool connected) {
   btUiWake();
 }
 
+// Bluetooth GAP callback hook: auto-confirms pairing requests from PC/Windows
+static void btCustomGapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
+  switch (event) {
+    case ESP_BT_GAP_CFM_REQ_EVT:
+      Serial.printf("[BT-GAP] SSP numeric comparison passkey=%u -> auto-confirm\n",
+                    (unsigned)param->cfm_req.num_val);
+      esp_bt_gap_ssp_confirm_reply(param->cfm_req.bda, true);
+      break;
+    case ESP_BT_GAP_KEY_NOTIF_EVT:
+      Serial.printf("[BT-GAP] SSP passkey notif=%u\n", (unsigned)param->key_notif.passkey);
+      break;
+    case ESP_BT_GAP_KEY_REQ_EVT:
+      Serial.println("[BT-GAP] SSP passkey request -> reply 0");
+      esp_bt_gap_ssp_passkey_reply(param->key_req.bda, true, 0);
+      break;
+    case ESP_BT_GAP_PIN_REQ_EVT: {
+      Serial.println("[BT-GAP] Legacy PIN request -> reply 1234");
+      esp_bt_pin_code_t pin = {'1', '2', '3', '4'};
+      esp_bt_gap_pin_reply(param->pin_req.bda, true, 4, pin);
+      break;
+    }
+    case ESP_BT_GAP_AUTH_CMPL_EVT:
+      if (param->auth_cmpl.stat == ESP_BT_STATUS_SUCCESS) {
+        Serial.printf("[BT-GAP] Auth success with '%s'\n", param->auth_cmpl.device_name);
+      } else {
+        Serial.printf("[BT-GAP] Auth failed, status=%d\n", param->auth_cmpl.stat);
+      }
+      break;
+    default:
+      break;
+  }
+  btSink.forwardGapCallback(event, param);
+}
+
 
 
 static void btDataCb(const uint8_t* data, uint32_t len) {
@@ -1882,6 +2039,18 @@ static void btDataCb(const uint8_t* data, uint32_t len) {
 static void btAudioTask(void*) {
   while (true) {
     if (!btModeActive) { vTaskDelay(20); continue; }
+    // Source changed sample rate (44.1k phones / 48k Linux). Done HERE, not in the
+    // run loop: this task is the only writer of the I2S channel and of btRingR, so
+    // the reconfig can never race a write and the ring flush needs no atomic.
+    if (btReqRate) {
+      uint16_t r = btReqRate; btReqRate = 0;
+      audioOut->SetApllForRate(r);    // APLL only for the 44.1 kHz family
+      audioOut->SetRate(r);
+      btActiveRate = r;
+      btRingR = btRingW;              // buffered frames belong to the old rate
+      btRateBytes = 0;
+      Serial.printf("[BT] sample rate %u Hz\n", (unsigned)r);
+    }
     // Boot / connect / disconnect chime has priority over the phone stream.
     int jr = jingleReq;
     if (jr >= 0) { jingleReq = -1; playJingleTask(jr); continue; }
@@ -1939,6 +2108,17 @@ static void btRawCb(const uint8_t* data, uint32_t len) {
   btRateBytes += len;
 }
 
+/** Source-negotiated sample rate. Linux/BlueZ picks 48 kHz SBC while phones
+ *  usually use 44.1 kHz; with the I2S pinned at 44.1 kHz the ring overran
+ *  continuously -> constant break-up (Phúc 14/9: "kết nối linux thì âm bị vỡ,
+ *  SPEED tầm 1500" = 1536 kbps = 48 kHz stereo 16-bit). Record it here and let
+ *  the run loop call SetRate(): it disables/reconfigs/enables the I2S channel,
+ *  which must never run in the BT callback task. */
+static void btSampleRateCb(uint16_t rate) {
+  if (rate < 8000 || rate > 96000) return;
+  btReqRate = rate;
+}
+
 /** SPEED line on the BT screen: kbps the phone is delivering (0 when idle). */
 static void drawBtSpeedLine() {
   if (screenMode != SCREEN_BT || screenClockActive) return;
@@ -1976,10 +2156,36 @@ static void updateBtUi(unsigned long now) {
   }
   if (now - lastStatMs >= 10000) {     // log only: link health / clock drift check
     lastStatMs = now;
-    Serial.printf("[BT] stat heap=%u drop=%u speed=%u\n",
+    Serial.printf("[BT] stat heap=%u drop=%u speed=%u rate=%u\n",
                   (unsigned)ESP.getFreeHeap(), (unsigned)btDropped,
-                  (unsigned)btSpeedKbps);
+                  (unsigned)btSpeedKbps, (unsigned)btActiveRate);
   }
+}
+
+/** Brightness readout on the BT brightness row — the TAP TARGET for auto mode
+ *  (Phúc 13/9): it shows "%3d%%" normally and "AUTO" while the LDR drives the
+ *  panel. FIXED 4-char field in both states -> repainting in place never leaves
+ *  a tail of the previous string and never flickers. */
+static void drawBtBriValue() {
+  tft.setTextSize(2);
+  tft.setTextColor(cfgAutoBright ? colAutoOn() : colInfoCyan(), COL_BTN);
+  tft.setCursor(BT_CTRL_BAR + BT_CTRL_BARW/2 - 4*6, BT_ROW_BRI_Y + 10);
+  if (cfgAutoBright) {
+    tft.print("AUTO");
+  } else {
+    char b[8]; snprintf(b, sizeof(b), "%3d%%", cfgBright);
+    tft.print(b);
+  }
+  tft.setTextSize(1);
+}
+
+/** Guarded partial repaint: used by the auto-brightness dirty consumer. While
+ *  auto is on the readout is the constant "AUTO", so there is nothing to
+ *  repaint; never draw over a screensaver/clock. */
+static void drawBtBriPct() {
+  if (screenMode != SCREEN_BT || screenClockActive) return;
+  if (cfgAutoBright) return;
+  drawBtBriValue();
 }
 
 static void drawBtScreen() {
@@ -2042,12 +2248,9 @@ static void drawBtScreen() {
   tft.setTextSize(2); tft.setTextColor(COL_TEXT, COL_BTN);
   tft.setCursor(BT_CTRL_L + BT_CTRL_LW/2 - 6, BT_ROW_BRI_Y + 10); tft.print("-");
   tft.fillRoundRect(BT_CTRL_BAR, BT_ROW_BRI_Y, BT_CTRL_BARW, BT_CTRL_H, 7, COL_BTN);
-  char bbuf[8]; snprintf(bbuf,sizeof(bbuf),"%d%%",cfgBright);
-  tft.setTextColor(colInfoCyan(), COL_BTN);
-  tft.setCursor(BT_CTRL_BAR + BT_CTRL_BARW/2 - (int)strlen(bbuf)*6, BT_ROW_BRI_Y + 10);
-  tft.print(bbuf);
+  drawBtBriValue();          // "%3d%%" or "AUTO" - this cell is the tap target
   tft.fillRoundRect(BT_CTRL_PLUS, BT_ROW_BRI_Y, BT_CTRL_LW, BT_CTRL_H, 7, COL_BTN);
-  tft.setTextColor(COL_TEXT, COL_BTN);
+  tft.setTextSize(2); tft.setTextColor(COL_TEXT, COL_BTN);
   tft.setCursor(BT_CTRL_PLUS + BT_CTRL_LW/2 - 6, BT_ROW_BRI_Y + 10); tft.print("+");
   tft.setTextSize(1);
   btCenterLine("Brightness", BT_ROW_BRI_Y + BT_CTRL_H + 10, 1, COL_DIM, COL_BG);
@@ -2201,9 +2404,21 @@ static void handleSettingsTouch() {
   // rows come from SET_ROW_Y[] - the same array the drawing uses
   if (ty>=SET_ROW_Y[SET_INVERT] && ty<SET_ROW_Y[SET_INVERT]+SET_CARD_H) { toggleInvert(); drawSettings(); return; }
   if (ty>=SET_ROW_Y[SET_BRIGHT] && ty<SET_ROW_Y[SET_BRIGHT]+SET_CARD_H) {
+    if (tx>=SET_AUTO_X && tx<SET_AUTO_X+SET_AUTO_W) {
+      // AUTO chip: flip the flag, seed the EMA from the live sensor, apply now
+      cfgAutoBright = !cfgAutoBright;
+      ldrRaw = -1; lastAutoMs = 0;
+      prefs.begin(NS_CFG,false); prefs.putBool("autob",cfgAutoBright); prefs.end();
+      if (cfgAutoBright) {
+        uint32_t acc=0; for (int i=0;i<8;i++) acc += analogRead(LDR_PIN);
+        ldrRaw = (int)(acc/8);
+        setBrightnessPct(ldrToPct(ldrRaw));
+      }
+      drawSettings(); return;
+    }
     bool changed=false;
-    if (tx>=SET_STEP_L && tx<SET_STEP_L+SET_STEP_BTN) { setBrightnessPct(cfgBright-10); changed=true; }
-    else if (tx>=SET_STEP_R && tx<SET_STEP_R+SET_STEP_BTN) { setBrightnessPct(cfgBright+10); changed=true; }
+    if (tx>=SET_STEP_L && tx<SET_STEP_L+SET_STEP_BTN) { autoBrightDisable(); setBrightnessPct(cfgBright-10); changed=true; }
+    else if (tx>=SET_STEP_R && tx<SET_STEP_R+SET_STEP_BTN) { autoBrightDisable(); setBrightnessPct(cfgBright+10); changed=true; }
     if (changed) { prefs.begin(NS_CFG,false); prefs.putInt("bright",cfgBright); prefs.end(); }
     drawSettings(); return;
   }
@@ -2497,8 +2712,9 @@ static void redrawCurrentScreen() {
     case SCREEN_KEYBOARD: drawKeyboard(); break;
     case SCREEN_CONNECTING: break;
     case SCREEN_CLOCK: drawClockScreen(); break;
-    case SCREEN_SAVER_LIFE:   svDrawLifeFull();   break;
-    case SCREEN_SAVER_MATRIX: svDrawMatrixFull(); break;
+    default:
+      if (isSaverScreen()) svFaceFull(svIdxForScreen((int)screenMode));
+      break;
   }
 }
 
@@ -2580,15 +2796,28 @@ static void btSwitchToSd() {   // from the BT-only screen back button
   ESP.restart();
 }
 
-// ── BT screensavers (Phúc 12/9) ────────────────────────────────────────────
-// BT mode has no network, so its clock is gone; instead, after 5 min without a
-// touch the two screensavers alternate every 5 min:
-//     Conway's Game of Life  <->  Matrix digital rain (katakana)
-// A tap anywhere returns to the BT screen; the phone stream keeps playing
-// (the audio task owns core 0, this runs on core 1).
+// ── BT screensavers (Phúc 14/9) ────────────────────────────────────────────
+// BT mode has no network, so it still has NO clock (Phúc's call). Instead the
+// standby cycles FOUR faces and a tap switches to the next one:
+//     Life -> Matrix -> Mưa sao băng -> Xếp gạch (không điểm) -> (loop)
+// (vũ trụ / warp starfield and tảo biển were both dropped by Phúc 14/9)
+// • no touch for SV_IDLE_MS  -> the saver comes up on the last face used
+// • a face auto-advances every SV_SWITCH_MS (5 min), like the 12/9 behaviour
+// • tap (< 600 ms)           -> next face right away
+// • hold  (>= 600 ms)        -> back to the BT screen (deliberate, hard to hit
+//                               by accident on a screen you are meant to leave alone)
+// The phone keeps streaming: the audio task owns core 0, this runs on core 1.
 #define SV_SWITCH_MS 300000UL          // 5 min: idle -> saver, and saver -> saver
+#define SV_TAP_MAX_MS 600              // shorter press = "next face", longer = "back"
+#define SV_COUNT 5
+enum { SV_LIFE = 0, SV_MATRIX, SV_METEOR, SV_TETRIS };
+static uint8_t svIdx = SV_LIFE;        // face on screen
+static bool    svSeeded = false;
+static unsigned long svEnteredMs = 0;
+static unsigned long svLastFrameMs = 0;
+
 #define LIFE_W 60
-#define LIFE_H 80                      // full panel: 80 * 4 px = 320"
+#define LIFE_H 80                      // full panel: 80 * 4 px = 320
 #define LIFE_CELL 4
 #define MX_COLS 20
 #define MX_ROWS 32                     // full panel: 32 * 10 px = 320
@@ -2601,9 +2830,34 @@ static uint8_t lifeNxt[LIFE_W*LIFE_H/8];
 static uint8_t mxGlyph[MX_COLS][MX_ROWS];
 static int8_t  mxHead[MX_COLS];
 static uint8_t mxLen[MX_COLS];
-static unsigned long svEnteredMs = 0;
-static unsigned long svLastFrameMs = 0;
-static uint8_t svNext = 1;             // 1 -> Life next, 2 -> Matrix next
+
+// NOTE: no helper here may name `ScreenMode` in a signature - Arduino injects the
+// generated prototypes ABOVE the enum, so such a function fails to compile
+// ("'ScreenMode' does not name a type"). Assign/convert inside the body instead.
+static void svApplyScreen(uint8_t i) {
+  switch (i) {
+    case SV_LIFE:   screenMode = SCREEN_SAVER_LIFE;   break;
+    case SV_MATRIX: screenMode = SCREEN_SAVER_MATRIX; break;
+    case SV_METEOR: screenMode = SCREEN_SAVER_METEOR; break;
+    default:        screenMode = SCREEN_SAVER_TETRIS; break;
+  }
+}
+static uint8_t svIdxForScreen(int m) {
+  switch (m) {
+    case SCREEN_SAVER_LIFE:   return SV_LIFE;
+    case SCREEN_SAVER_MATRIX: return SV_MATRIX;
+    case SCREEN_SAVER_METEOR: return SV_METEOR;
+    default:                  return SV_TETRIS;
+  }
+}
+static unsigned long svFrameMs(uint8_t i) {
+  switch (i) {
+    case SV_LIFE:   return 220;
+    case SV_MATRIX: return 90;
+    case SV_METEOR: return 60;
+    default:        return 60;      // tetris: 2 rows/frame inside the tick
+  }
+}
 
 static inline void lifeSetBit(uint8_t* b, int idx, bool v) {
   if (v) b[idx >> 3] |= (uint8_t)(1u << (idx & 7));
@@ -2693,34 +2947,444 @@ static void svMatrixStep() {
   }
 }
 
-static void svEnter(uint8_t which) {
-  screenMode = (which == 1) ? SCREEN_SAVER_LIFE : SCREEN_SAVER_MATRIX;
-  svEnteredMs = millis();
-  svLastFrameMs = 0;
-  if (which == 1) { svLifeSeed();   svDrawLifeFull(); }
-  else            { svMatrixSeed(); svDrawMatrixFull(); }
+// ── Face 4: Mưa sao băng + sao lấp lánh (thay mặt tảo biển — Phúc 14/9) ──────
+// Pure per-pixel face: the sky is plain black, so erasing a meteor is just
+// drawPixel(x, y, black). The twinkling stars are redrawn every frame (130 px,
+// ~free), which is why a meteor crossing a star never leaves a hole. No static
+// background buffer, no dirty-cell list -> ~1.4 KB of DRAM in total.
+#define MT_N 170
+#define MT_MET 6
+static uint16_t mtSX[MT_N], mtSY[MT_N];   // 0..316: uint8_t TRÀN ở y>255,
+                                          // đẩy mọi sao nửa dưới lên y-256 (màn dưới trống)
+static uint8_t mtSCross[(MT_N + 7) / 8];
+static float   mtSPh[MT_N], mtSSp[MT_N];
+static float   mtX[MT_MET], mtY[MT_MET], mtVX[MT_MET], mtVY[MT_MET];
+static uint8_t mtLen[MT_MET];
+static int16_t mtDelay[MT_MET];
+static uint16_t mtT = 0;
+static uint16_t mtStarCol[4], mtTailCol[7];
+
+static void svMeteorSpawn(int i, int dMin, int dMax) {
+  bool right = (random(100) < 65);                    // most fall down-right
+  float vx = (float)(34 + random(29)) / 10.0f;        // 3.4 .. 6.2 px/frame
+  float vy = (float)(13 + random(19)) / 10.0f;        // 1.3 .. 3.1
+  mtVX[i] = right ? vx : -vx;
+  mtVY[i] = vy;
+  mtX[i] = right ? (float)(random(300) - 60) : (float)(40 + random(260));
+  mtY[i] = (float)(random(SCR_H - 20) - 40);   // may also start low
+  mtLen[i] = (uint8_t)(11 + random(12));
+  int span = dMax - dMin; if (span < 1) span = 1;
+  mtDelay[i] = (int16_t)(dMin + random(span));
 }
-/** Called from loopBtMode(): BT idle -> saver, then saver -> saver every 5 min. */
+static void svMeteorSeed() {
+  mtStarCol[0] = tft.color565(92,98,128);
+  mtStarCol[1] = tft.color565(136,150,190);
+  mtStarCol[2] = tft.color565(200,214,246);
+  mtStarCol[3] = tft.color565(255,255,255);
+  mtTailCol[0] = tft.color565(255,255,255);
+  mtTailCol[1] = tft.color565(226,236,255);
+  mtTailCol[2] = tft.color565(186,200,240);
+  mtTailCol[3] = tft.color565(140,156,200);
+  mtTailCol[4] = tft.color565(104,118,158);
+  mtTailCol[5] = tft.color565(74,84,116);
+  mtTailCol[6] = tft.color565(52,60,84);
+  memset(mtSCross, 0, sizeof(mtSCross));
+  // Jittered 10 x 13 grid, one star per cell: pure random x/y clumped and left
+  // 20-row bands with 2-3 pixels only, which read as a missing strip on the panel.
+  int si = 0;
+  for (int gy = 0; gy < 17 && si < MT_N; gy++)
+    for (int gx = 0; gx < 10 && si < MT_N; gx++, si++) {
+      mtSX[si] = (uint16_t)(gx*24 + 2 + random(20));
+      // Rows must be spaced SCR_H/13 = 24.6 px, NOT 32: 13*32 = 416 > 320, so the
+      // last three rows clamped onto the bottom edge and the lower quarter of the
+      // panel stayed black (Phúc: "màn hình sao chưa full màn, bị đen ở dưới").
+      int y = (gy * SCR_H) / 17 + 1 + random(15);
+      if (y > SCR_H-1) y = SCR_H-1;
+      mtSY[si] = (uint16_t)y;
+      mtSPh[si] = (float)random(628) / 100.0f;
+      mtSSp[si] = (float)(12 + random(21)) / 1000.0f;  // 0.012 .. 0.032
+      if (random(100) < 14) mtSCross[si >> 3] |= (uint8_t)(1u << (si & 7));
+    }
+  mtT = 0;
+  for (int i = 0; i < MT_MET; i++) svMeteorSpawn(i, 0, 90);
+}
+/** Draw (or erase with black) star i's twinkle pixel + arms. */
+static void svMeteorStar(int i) {
+  float b = 0.5f + 0.5f*sinf(mtT * mtSSp[i] * 6.0f + mtSPh[i]);
+  uint8_t lvl = (b < 0.30f) ? 0 : (b < 0.58f ? 1 : (b < 0.84f ? 2 : 3));
+  tft.drawPixel(mtSX[i], mtSY[i], mtStarCol[lvl]);
+  if (!(mtSCross[i >> 3] & (1u << (i & 7))) || lvl < 1) return;
+  int x = mtSX[i], y = mtSY[i];
+  const int8_t ax[4] = {1,-1,0,0}, ay[4] = {0,0,1,-1};
+  for (int k = 0; k < 4; k++)
+    for (int r = 1; r <= 2; r++) {
+      int xx = x + ax[k]*r, yy = y + ay[k]*r;
+      if (xx < 0 || xx >= SCR_W || yy < 0 || yy >= SCR_H) continue;
+      tft.drawPixel(xx, yy, mtStarCol[r == 2 ? 1 : (lvl >= 2 ? 3 : 2)]);
+    }
+}
+static void svMeteorPlot(int i, bool erase) {
+  int x = (int)roundf(mtX[i]), y = (int)roundf(mtY[i]);
+  float n = sqrtf(mtVX[i]*mtVX[i] + mtVY[i]*mtVY[i]);
+  if (n < 0.01f) n = 1.0f;
+  float ux = mtVX[i]/n, uy = mtVY[i]/n;
+  for (int k = 0; k < mtLen[i]; k++) {
+    if (k > 6 && (k % 3)) continue;                   // tail breaks up (pixel art)
+    int xx = (int)roundf(mtX[i] - ux*k);
+    int yy = (int)roundf(mtY[i] - uy*k);
+    if (xx < 0 || xx >= SCR_W || yy < 0 || yy >= SCR_H) continue;
+    uint16_t col = erase ? COL_BG : mtTailCol[k/3 > 6 ? 6 : k/3];
+    tft.drawPixel(xx, yy, col);
+  }
+  (void)x; (void)y;
+}
+static void svMeteorStep() {
+  mtT++;
+  for (int i = 0; i < MT_MET; i++) {
+    if (mtDelay[i] > 0) { mtDelay[i]--; continue; }
+    svMeteorPlot(i, true);                            // erase the old streak
+    mtX[i] += mtVX[i];
+    mtY[i] += mtVY[i];
+    if (mtX[i] > SCR_W + 70 || mtX[i] < -70 || mtY[i] > SCR_H + 50)
+      svMeteorSpawn(i, 6, 70);
+  }
+  for (int i = 0; i < MT_N; i++) svMeteorStar(i);     // stars redrawn: no holes
+  for (int i = 0; i < MT_MET; i++)
+    if (mtDelay[i] <= 0) svMeteorPlot(i, false);
+}
+static void svMeteorFull() {
+  tft.fillScreen(COL_BG);
+  for (int i = 0; i < MT_N; i++) svMeteorStar(i);
+  for (int i = 0; i < MT_MET; i++)
+    if (mtDelay[i] <= 0) svMeteorPlot(i, false);
+}
+
+// ── Face 5: Xếp gạch tự động (the CPU plays a game of Tetris) ──────────────
+#define TET_C 16
+#define TET_COLS 10
+#define TET_ROWS 19
+#define TET_X ((SCR_W - TET_COLS*TET_C)/2)      // 40
+#define TET_Y 8                                 // 8 + 19*16 = 312 (8 px margin)
+static const int8_t TET_BASE[7][4][2] = {
+  {{0,1},{1,1},{2,1},{3,1}},   // I
+  {{1,0},{2,0},{1,1},{2,1}},   // O
+  {{1,0},{0,1},{1,1},{2,1}},   // T
+  {{1,0},{2,0},{0,1},{1,1}},   // S
+  {{0,0},{1,0},{1,1},{2,1}},   // Z
+  {{0,0},{0,1},{1,1},{2,1}},   // J
+  {{2,0},{0,1},{1,1},{2,1}}    // L
+};
+static uint16_t tetCol[7], tetLit[7], tetDark[7], tetGridCol;
+static uint8_t tetB[TET_COLS][TET_ROWS], tetTmp[TET_COLS][TET_ROWS];
+static uint8_t tetKind, tetRot, tetTgtRot, tetPhase, tetFlashCnt;
+static int     tetPX, tetPY, tetTgtX;
+static uint32_t tetFlashRows;
+static int8_t  tetDrawnX[6], tetDrawnY[6];
+static uint8_t tetDrawnN = 0;
+
+static void tetShape(uint8_t kind, uint8_t rot, int8_t out[4][2]) {
+  int8_t c[4][2];
+  for (int i = 0; i < 4; i++) { c[i][0] = TET_BASE[kind][i][0]; c[i][1] = TET_BASE[kind][i][1]; }
+  for (uint8_t r = 0; r < (rot & 3); r++) {
+    int8_t mnx = 99, mny = 99;
+    for (int i = 0; i < 4; i++) {
+      int8_t nx = (int8_t)(-c[i][1]), ny = c[i][0];
+      c[i][0] = nx; c[i][1] = ny;
+      if (nx < mnx) mnx = nx;
+      if (ny < mny) mny = ny;
+    }
+    for (int i = 0; i < 4; i++) { c[i][0] -= mnx; c[i][1] -= mny; }
+  }
+  memcpy(out, c, 8 * sizeof(int8_t));
+}
+static bool tetFits(uint8_t kind, uint8_t rot, int px, int py, uint8_t b[TET_COLS][TET_ROWS]) {
+  int8_t c[4][2]; tetShape(kind, rot, c);
+  for (int i = 0; i < 4; i++) {
+    int x = px + c[i][0], y = py + c[i][1];
+    if (x < 0 || x >= TET_COLS || y >= TET_ROWS) return false;
+    if (y >= 0 && b[x][y]) return false;
+  }
+  return true;
+}
+/** Same heuristic the approved mockup used: height + lines - holes - bumpiness. */
+static void tetBest(uint8_t kind, uint8_t &bestRot, int &bestX) {
+  float bestScore = -1e9f; bestRot = 0; bestX = 3;
+  for (uint8_t rot = 0; rot < 4; rot++) {
+    for (int px = -3; px < TET_COLS; px++) {
+      int py = -4;
+      if (!tetFits(kind, rot, px, py, tetB)) continue;
+      while (tetFits(kind, rot, px, py + 1, tetB)) py++;
+      memcpy(tetTmp, tetB, sizeof(tetTmp));
+      int8_t c[4][2]; tetShape(kind, rot, c);
+      for (int i = 0; i < 4; i++) {
+        int x = px + c[i][0], y = py + c[i][1];
+        if (y >= 0 && x >= 0 && x < TET_COLS) tetTmp[x][y] = 1;
+      }
+      int lines = 0;
+      for (int r = 0; r < TET_ROWS; r++) {
+        bool full = true;
+        for (int x = 0; x < TET_COLS; x++) if (!tetTmp[x][r]) { full = false; break; }
+        if (full) lines++;
+      }
+      if (lines) {                                   // drop the completed rows
+        for (int r = TET_ROWS - 1; r >= 0; r--) {
+          bool full = true;
+          for (int x = 0; x < TET_COLS; x++) if (!tetTmp[x][r]) { full = false; break; }
+          if (!full) continue;
+          for (int rr = r; rr > 0; rr--)
+            for (int x = 0; x < TET_COLS; x++) tetTmp[x][rr] = tetTmp[x][rr-1];
+          for (int x = 0; x < TET_COLS; x++) tetTmp[x][0] = 0;
+          r++;
+        }
+      }
+      int holes = 0, sumH = 0, bump = 0, hh[TET_COLS];
+      for (int x = 0; x < TET_COLS; x++) {
+        int top = TET_ROWS;
+        for (int r = 0; r < TET_ROWS; r++) if (tetTmp[x][r]) { top = r; break; }
+        hh[x] = TET_ROWS - top;
+        sumH += hh[x];
+        for (int r = top; r < TET_ROWS; r++) if (!tetTmp[x][r]) holes++;
+      }
+      for (int x = 0; x < TET_COLS - 1; x++) bump += abs(hh[x] - hh[x+1]);
+      float s = -0.51f*(float)sumH + 0.76f*(float)lines - 0.36f*(float)holes - 0.18f*(float)bump;
+      if (s > bestScore) { bestScore = s; bestRot = rot; bestX = px; }
+    }
+  }
+}
+/** The board stores kind+1 (0 = empty), the colour tables are 0..6: passing the
+ *  raw stored value read PAST tetCol[6], so every "L" block filled with garbage
+ *  (black) and looked transparent with only its bevel showing (Phuc 14/9), while
+ *  the other six kinds borrowed the next piece's colour. */
+static inline uint8_t tetColIdx(uint8_t v) { return (uint8_t)((v - 1) % 7); }
+static void tetDrawCellRaw(int c, int r, uint8_t kind, bool white) {
+  if (kind > 6) kind = 0;                       // defensive: never index past the table
+  int x0 = TET_X + c*TET_C, y0 = TET_Y + r*TET_C;
+  uint16_t col = white ? TFT_WHITE : tetCol[kind];
+  tft.fillRect(x0+1, y0+1, TET_C-2, TET_C-2, col);
+  uint16_t lit = white ? TFT_WHITE : tetLit[kind];
+  uint16_t dk  = white ? TFT_WHITE : tetDark[kind];
+  tft.drawFastHLine(x0+1, y0+1, TET_C-2, lit);
+  tft.drawFastVLine(x0+1, y0+1, TET_C-2, lit);
+  tft.drawFastHLine(x0+1, y0+TET_C-2, TET_C-2, dk);
+  tft.drawFastVLine(x0+TET_C-2, y0+1, TET_C-2, dk);
+}
+static void tetEraseCellRaw(int c, int r) {
+  int x0 = TET_X + c*TET_C, y0 = TET_Y + r*TET_C;
+  tft.fillRect(x0, y0, TET_C, TET_C, COL_BG);
+  if (c > 0) tft.drawFastVLine(x0, y0, TET_C, tetGridCol);
+  if (r > 0) tft.drawFastHLine(x0, y0, TET_C, tetGridCol);
+}
+static void tetErasePiece() {
+  for (int i = 0; i < tetDrawnN; i++) {
+    int x = tetDrawnX[i], y = tetDrawnY[i];
+    if (x >= 0 && x < TET_COLS && y >= 0 && y < TET_ROWS) tetEraseCellRaw(x, y);
+  }
+  tetDrawnN = 0;
+}
+static void tetDrawPiece() {
+  int8_t c[4][2]; tetShape(tetKind, tetRot, c);
+  tetDrawnN = 0;
+  for (int i = 0; i < 4; i++) {
+    int x = tetPX + c[i][0], y = tetPY + c[i][1];
+    if (x < 0 || x >= TET_COLS || y < 0 || y >= TET_ROWS) continue;
+    tetDrawCellRaw(x, y, tetKind, false);
+    if (tetDrawnN < 6) { tetDrawnX[tetDrawnN] = (int8_t)x; tetDrawnY[tetDrawnN] = (int8_t)y; tetDrawnN++; }
+  }
+}
+static void tetDrawGrid() {
+  tft.drawRect(TET_X-2, TET_Y-2, TET_COLS*TET_C+3, TET_ROWS*TET_C+3, tft.color565(34,34,42));
+  for (int c = 1; c < TET_COLS; c++)
+    tft.drawFastVLine(TET_X + c*TET_C, TET_Y, TET_ROWS*TET_C, tetGridCol);
+  for (int r = 1; r < TET_ROWS; r++)
+    tft.drawFastHLine(TET_X, TET_Y + r*TET_C, TET_COLS*TET_C, tetGridCol);
+}
+static void tetDrawBoard() {
+  for (int c = 0; c < TET_COLS; c++)
+    for (int r = 0; r < TET_ROWS; r++) {
+      if (!tetB[c][r]) continue;
+      bool flash = (tetFlashCnt && (tetFlashRows & (1u << r)));
+      tetDrawCellRaw(c, r, tetColIdx(tetB[c][r]), flash);
+    }
+}
+static void svTetFull() {
+  tft.fillScreen(COL_BG);
+  tetDrawGrid();
+  tetDrawBoard();
+  if (!tetFlashCnt) tetDrawPiece();
+}
+static void tetPrefill() {
+  memset(tetB, 0, sizeof(tetB));
+  for (int r = TET_ROWS - 3; r < TET_ROWS; r++) {
+    for (int c = 0; c < TET_COLS; c++)
+      if (random(100) < 62) tetB[c][r] = (uint8_t)(1 + random(7));
+    bool full = true;
+    for (int c = 0; c < TET_COLS; c++) if (!tetB[c][r]) full = false;
+    if (full) tetB[random(TET_COLS)][r] = 0;
+  }
+}
+static void tetSpawn() {
+  tetKind = (uint8_t)random(7);
+  tetRot = 0;
+  tetPX = 3;
+  int8_t c[4][2]; tetShape(tetKind, 0, c);
+  int minY = 0;
+  for (int i = 0; i < 4; i++) if (c[i][1] < minY) minY = c[i][1];
+  tetPY = -minY;
+  tetTgtRot = 0; tetTgtX = 3;
+  tetBest(tetKind, tetTgtRot, tetTgtX);
+  tetPhase = 0;
+  tetDrawnN = 0;
+}
+static void svTetSeed() {
+  static const uint8_t rgb[7][3] = {{60,210,220},{225,215,60},{180,60,200},{70,200,90},
+                                    {215,60,60},{60,110,230},{230,150,50}};
+  for (int i = 0; i < 7; i++) {
+    tetCol[i]  = tft.color565(rgb[i][0], rgb[i][1], rgb[i][2]);
+    tetLit[i]  = tft.color565(min(255, (int)(rgb[i][0]*1.35f) + 20),
+                              min(255, (int)(rgb[i][1]*1.35f) + 20),
+                              min(255, (int)(rgb[i][2]*1.35f) + 20));
+    tetDark[i] = tft.color565(rgb[i][0]/2, rgb[i][1]/2, rgb[i][2]/2);
+  }
+  tetGridCol = tft.color565(22,22,28);
+  tetFlashRows = 0; tetFlashCnt = 0;
+  tetPrefill();
+  tetSpawn();
+}
+static void tetLockPiece() {
+  int8_t c[4][2]; tetShape(tetKind, tetRot, c);
+  for (int i = 0; i < 4; i++) {
+    int x = tetPX + c[i][0], y = tetPY + c[i][1];
+    if (y >= 0 && y < TET_ROWS && x >= 0 && x < TET_COLS) tetB[x][y] = (uint8_t)(tetKind + 1);
+  }
+  tetFlashRows = 0;
+  for (int r = 0; r < TET_ROWS; r++) {
+    bool full = true;
+    for (int c2 = 0; c2 < TET_COLS; c2++) if (!tetB[c2][r]) { full = false; break; }
+    if (full) tetFlashRows |= (1u << r);
+  }
+  if (tetFlashRows) tetFlashCnt = 3;
+  else tetSpawn();
+}
+static void tetCollapse() {
+  int write = TET_ROWS - 1;
+  for (int r = TET_ROWS - 1; r >= 0; r--) {
+    if (tetFlashRows & (1u << r)) continue;
+    if (write != r) for (int x = 0; x < TET_COLS; x++) tetB[x][write] = tetB[x][r];
+    write--;
+  }
+  for (int r = write; r >= 0; r--) for (int x = 0; x < TET_COLS; x++) tetB[x][r] = 0;
+  tetFlashRows = 0; tetFlashCnt = 0;
+}
+static void svTetStep() {
+  if (tetFlashCnt) {                                   // blink the completed rows
+    tetDrawBoard();
+    if (--tetFlashCnt == 0) {
+      tetCollapse();
+      tft.fillRect(0, TET_Y, SCR_W, TET_ROWS*TET_C, COL_BG);
+      tetDrawBoard();
+          tetSpawn();
+      tetDrawPiece();
+    }
+    return;
+  }
+  tetErasePiece();
+  if (tetPhase == 0) {                                 // slide to the chosen column
+    if (tetRot != tetTgtRot) {
+      // Rotate one step per frame; if the next step is blocked, give up on the
+      // planned rotation and just drop from here (snapping to the target angle
+      // could clip the piece into the stack).
+      if (tetFits(tetKind, (uint8_t)((tetRot + 1) & 3), tetPX, tetPY, tetB))
+        tetRot = (uint8_t)((tetRot + 1) & 3);
+      else tetPhase = 1;
+    } else if (tetPX != tetTgtX) {
+      int step = (tetTgtX > tetPX) ? 1 : -1;
+      if (tetFits(tetKind, tetRot, tetPX + step, tetPY, tetB)) tetPX += step;
+      else tetPhase = 1;
+    } else {
+      tetPhase = 1;
+    }
+  } else {                                            // drop 2 rows per frame
+    for (int k = 0; k < 2; k++) {
+      if (tetFits(tetKind, tetRot, tetPX, tetPY + 1, tetB)) tetPY++;
+      else break;
+    }
+    if (!tetFits(tetKind, tetRot, tetPX, tetPY + 1, tetB)) {
+      tetLockPiece();
+      tetDrawBoard();
+          if (!tetFlashCnt) tetDrawPiece();
+      bool topOut = false;                             // piece reached the ceiling
+      for (int c = 0; c < TET_COLS; c++) if (tetB[c][0]) topOut = true;
+      if (topOut) {
+        tft.fillRect(0, TET_Y, SCR_W, TET_ROWS*TET_C, COL_BG);
+        tetPrefill(); tetSpawn();
+        tetDrawBoard(); tetDrawPiece();
+      }
+      return;
+    }
+  }
+  tetDrawPiece();
+}
+
+// ── saver dispatch: enter / step / full repaint ─────────────────────────────
+static void svFaceEnter(uint8_t i) {
+  switch (i) {
+    case SV_LIFE:   svLifeSeed();   svDrawLifeFull();   break;
+    case SV_MATRIX: svMatrixSeed(); svDrawMatrixFull(); break;
+    case SV_METEOR: svMeteorSeed(); svMeteorFull(); break;
+    default:        svTetSeed();    svTetFull();        break;
+  }
+}
+static void svFaceStep(uint8_t i) {
+  switch (i) {
+    case SV_LIFE:   svLifeStep();   break;
+    case SV_MATRIX: svMatrixStep(); break;
+    case SV_METEOR: svMeteorStep(); break;
+    default:        svTetStep();    break;
+  }
+}
+static void svFaceFull(uint8_t i) {
+  switch (i) {
+    case SV_LIFE:   svDrawLifeFull();   break;
+    case SV_MATRIX: svDrawMatrixFull(); break;
+    case SV_METEOR: svMeteorFull(); break;
+    default:        svTetFull();        break;
+  }
+}
+static void svEnterIdx(uint8_t idx, bool persist) {
+  if (!svSeeded) { randomSeed((uint32_t)micros()); svSeeded = true; }
+  svIdx = (uint8_t)(idx % SV_COUNT);
+  svApplyScreen(svIdx);
+  svEnteredMs = millis();
+  svLastFrameMs = svEnteredMs;
+  svFaceEnter(svIdx);
+  if (persist) { prefs.begin(NS_CFG, false); prefs.putUChar("svi", svIdx); prefs.end(); }
+  Serial.printf("[SV] face=%u heap=%u\n", (unsigned)svIdx, (unsigned)ESP.getFreeHeap());
+}
+/** A tap on a saver: move to the next face and remember the choice. */
+static void svNextFace() {
+  noteUserActivity();
+  svEnterIdx((uint8_t)((svIdx + 1) % SV_COUNT), true);
+}
+/** Called from loopBtMode(): BT idle -> saver, auto-advance, per-face frame tick. */
 static void svIdleTick() {
   unsigned long now = millis();
   if (screenMode == SCREEN_BT) {
     if (now - lastUserActivityMs >= SV_SWITCH_MS) {
-      svEnter(svNext);
-      svNext = (svNext == 1) ? 2 : 1;
+      uint8_t i = SV_LIFE;
+      prefs.begin(NS_CFG, true); i = prefs.getUChar("svi", SV_LIFE); prefs.end();
+      if (i >= SV_COUNT) i = SV_LIFE;
+      svEnterIdx(i, false);          // resume the face he used last (no NVS write)
     }
     return;
   }
-  if (screenMode == SCREEN_SAVER_LIFE || screenMode == SCREEN_SAVER_MATRIX) {
-    if (now - svEnteredMs >= SV_SWITCH_MS) {
-      svEnter((screenMode == SCREEN_SAVER_LIFE) ? 2 : 1);
-      return;
-    }
-    unsigned long step = (screenMode == SCREEN_SAVER_LIFE) ? 220 : 90;
-    if (now - svLastFrameMs >= step) {
-      svLastFrameMs = now;
-      if (screenMode == SCREEN_SAVER_LIFE) svLifeStep();
-      else                                 svMatrixStep();
-    }
+  if (!isSaverScreen()) return;
+  if (now - svEnteredMs >= SV_SWITCH_MS) {              // auto-advance every 5 min
+    svEnterIdx((uint8_t)((svIdx + 1) % SV_COUNT), false);
+    return;
+  }
+  if (now - svLastFrameMs >= svFrameMs(svIdx)) {
+    svLastFrameMs = now;
+    svFaceStep(svIdx);
   }
 }
 
@@ -2747,12 +3411,26 @@ static void runBtModeSetup() {
   btSink.set_avrc_connection_state_callback(btAvrcConnCb);
   btSink.set_stream_reader(btDataCb, false);
   btSink.set_raw_stream_reader(btRawCb);     // SPEED measurement (decoded PCM)
-  xTaskCreatePinnedToCore(btAudioTask, "btAudio", 4096, nullptr, 8, nullptr, 0);
+  btSink.set_sample_rate_callback(btSampleRateCb);   // 44.1k phones / 48k Linux
+  xTaskCreatePinnedToCore(btAudioTask, "btAudio", 6144, nullptr, 8, nullptr, 0);
   applyVolumePercent();
 
   // No WiFi is ever started in this mode -> the radio is free, start now.
   btSink.start(BT_DEVICE_NAME);
   btModeActive = true;        // audio task drains immediately
+
+  // Set Class of Device (CoD) so Windows/PC recognizes device as Audio Loudspeaker (0x240414)
+  esp_bt_cod_t cod = {};
+  cod.major = ESP_BT_COD_MAJOR_DEV_AV;         // Audio / Video (0x04)
+  cod.minor = 0b000101;                        // Loudspeaker (0x14 >> 2)
+  cod.service = ESP_BT_COD_SRVC_AUDIO | ESP_BT_COD_SRVC_RENDERING;
+  esp_err_t codErr = esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_ALL);
+  Serial.printf("[BT] Set Class of Device (Loudspeaker 0x240414): %d\n", (int)codErr);
+
+  // Hook GAP callback to auto-confirm Windows/PC SSP pairing & PIN requests
+  esp_bt_gap_register_callback(btCustomGapCallback);
+  esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+
   delay(500);
   btConnected = btSink.is_connected();
   Serial.printf("[BT] started heap=%u\n", (unsigned)ESP.getFreeHeap());
@@ -2809,12 +3487,26 @@ static void btVolStep(bool up) {
 }
 
 static void btBriStep(bool up) {
+  autoBrightDisable();               // manual stepper wins over auto
   int b = cfgBright + (up ? 10 : -10);
   setBrightnessPct(b);
   prefs.begin(NS_CFG, false); prefs.putInt("bright", cfgBright); prefs.end();
 }
 
-// Returns true when the tap landed on a control (volume/brightness row).
+/** Toggles auto brightness — tap the brightness % readout on the BT screen
+ *  (it flips to "AUTO"), or the AUTO pill in Settings. Same NVS key. */
+static void btToggleAuto() {
+  cfgAutoBright = !cfgAutoBright;
+  ldrRaw = -1; lastAutoMs = 0;
+  prefs.begin(NS_CFG, false); prefs.putBool("autob", cfgAutoBright); prefs.end();
+  if (cfgAutoBright) {
+    uint32_t acc=0; for (int i=0;i<8;i++) acc += analogRead(LDR_PIN);
+    ldrRaw = (int)(acc/8);
+    setBrightnessPct(ldrToPct(ldrRaw));
+  }
+}
+
+// Returns true when the tap landed on a control (volume row / brightness row).
 static bool btHandleCtrl(int16_t tx, int16_t ty) {
   if (ty >= BT_ROW_VOL_Y && ty < BT_ROW_VOL_Y + BT_CTRL_H) {
     if      (tx <  BT_CTRL_BAR)  btVolStep(false);
@@ -2825,7 +3517,7 @@ static bool btHandleCtrl(int16_t tx, int16_t ty) {
   if (ty >= BT_ROW_BRI_Y && ty < BT_ROW_BRI_Y + BT_CTRL_H) {
     if      (tx <  BT_CTRL_BAR)  btBriStep(false);
     else if (tx >= BT_CTRL_PLUS) btBriStep(true);
-    else return false;
+    else btToggleAuto();          // the % cell itself = AUTO on/off
     return true;
   }
   return false;
@@ -2837,12 +3529,20 @@ static void btOnlyHandleTouch() {
   unsigned long now = millis();
   if (now - lastTouchTime < TOUCH_DEBOUNCE_MS) return;
   lastTouchTime = now;
-  while (ts.touched()) { delay(1); if (millis() - now > 400) break; }
-  // Screensaver showing -> any tap returns to the BT screen.
-  if (screenMode == SCREEN_SAVER_LIFE || screenMode == SCREEN_SAVER_MATRIX) {
-    noteUserActivity();
-    screenMode = SCREEN_BT;
-    drawBtScreen();
+  // Measure how long the finger stays down: a saver uses the press LENGTH as its
+  // only input (tap = next face, hold = back to the BT screen).
+  unsigned long downAt = millis();
+  while (ts.touched()) { delay(1); if (millis() - downAt > 3000) break; }
+  unsigned long heldMs = millis() - downAt;
+  // Screensaver showing: short tap = next face, long press = back to the BT screen.
+  if (isSaverScreen()) {
+    if (heldMs >= SV_TAP_MAX_MS) {
+      noteUserActivity();
+      screenMode = SCREEN_BT;
+      drawBtScreen();
+    } else {
+      svNextFace();
+    }
     return;
   }
   if (screenMode == SCREEN_CLOCK) {
@@ -2860,6 +3560,11 @@ static void btOnlyHandleTouch() {
 static void loopBtMode() {
   pollBootButton();          // BOOT button: backlight toggle
   svIdleTick();              // 5-min idle -> Life/Matrix saver (never the clock)
+  autoBrightTick();          // LDR -> backlight (same tick as SD mode)
+  if (briUiDirty) {          // repaint only the live % readout (never over a saver)
+    briUiDirty = false;
+    drawBtBriPct();
+  }
   static unsigned long lastPoll = 0;
   static int lastConn = -1;      // -1 = seed from the first poll (no boot chime)
   unsigned long now = millis();
@@ -2939,6 +3644,7 @@ void setup() {
   cfgBright = prefs.getInt("bright", 60);
   volumePercent = prefs.getInt("vol", 10);   // SD default 10 (Phúc, 12/9 - the "9" was the boot chime)
   bootModeBt = (prefs.getString("bootmode", "sd") == "bt");
+  cfgAutoBright = prefs.getBool("autob", false);   // ambient-light auto brightness
   String s = prefs.getString("ssid", "");
   String p = prefs.getString("pass", "");
   if (s.length()>0){ strncpy(cfgSSID,s.c_str(),32); cfgSSID[32]='\0'; }
@@ -2947,6 +3653,10 @@ void setup() {
 
   applyInvert();
   setBrightnessPct(cfgBright);
+
+  // LDR for auto brightness: 12-bit, full 3.3 V range on GPIO34
+  analogReadResolution(12);
+  analogSetPinAttenuation(LDR_PIN, ADC_11db);
 
   // Display + touch are common to BOTH modes, and the boot-phase WiFi UI uses
   // them before any mode is chosen (moved up from the mode setups).
@@ -3075,6 +3785,112 @@ static bool bootTimeSync() {
   return connected;
 }
 
+// ── SD mount: nhieu chien luoc + thu lai tai cho (Phuc 16/9) ───────────────
+// The SD tung dung cho viec khac (dien thoai/camera/PC format lai, tao partition
+// table, cluster size lon) roi copy du lieu cu ve thuong mount that bai o lan thu
+// dau. Ban cu chi thu DUNG MOT lan roi treo o man "SD Failed!" -> phai reboot.
+// Gio: thu lan luot 5 muc toc do SPI, va cho phep cham man hinh (hoac tu dong moi
+// 5 giay) de mount lai ngay khi the da san sang - khong can reboot.
+static const uint32_t SD_MOUNT_FREQS[] = {20000000UL, 10000000UL, 4000000UL, 1000000UL, 400000UL};
+static const int SD_MOUNT_STEPS = (int)(sizeof(SD_MOUNT_FREQS) / sizeof(SD_MOUNT_FREQS[0]));
+static int sdMountStep = -1;      // muc toc do da mount thanh cong
+
+static void sdReleaseBus() {
+  // CHI unmount the (khong dung SPI.end(): CYD dung chung VSPI cho TFT + SD,
+  // ket thuc bus se lam man hinh chet). SDFS::end() chi unmount + uninit.
+  SD.end();
+  delay(70);
+}
+
+static bool sdMountSmart() {
+  for (int i = 0; i < SD_MOUNT_STEPS; i++) {
+    sdReleaseBus();
+    if (SD.begin(SD_CS, SPI, SD_MOUNT_FREQS[i], "/sd", 5, false)) {
+      sdMountStep = i;
+      Serial.printf("[SD] mount OK @ %lu Hz\n", (unsigned long)SD_MOUNT_FREQS[i]);
+      return true;
+    }
+    Serial.printf("[SD] mount fail @ %lu Hz\n", (unsigned long)SD_MOUNT_FREQS[i]);
+    delay(40);
+  }
+  sdMountStep = -1;
+  return false;
+}
+
+static void drawSdWaitScreen(int attempts) {
+  tft.fillScreen(COL_BG);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_RED, COL_BG);
+  const char* t1 = "SD Failed!";
+  tft.setCursor((SCR_W - 12 * (int)strlen(t1)) / 2, 56);
+  tft.print(t1);
+
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_YELLOW, COL_BG);
+  const char* t2 = "Cham man hinh de thu lai";
+  tft.setCursor((SCR_W - 6 * (int)strlen(t2)) / 2, 94);
+  tft.print(t2);
+  const char* t3 = "(tu dong thu lai moi 5 giay)";
+  tft.setCursor((SCR_W - 6 * (int)strlen(t3)) / 2, 108);
+  tft.print(t3);
+
+  char l4[48];
+  snprintf(l4, sizeof(l4), "Da thu: %d lan  -  %d muc toc do", attempts, SD_MOUNT_STEPS);
+  tft.setTextColor(colInfoCyan(), COL_BG);
+  tft.setCursor((SCR_W - 6 * (int)strlen(l4)) / 2, 134);
+  tft.print(l4);
+
+  tft.setTextColor(COL_DIM, COL_BG);
+  const char* t5 = "The phai la FAT32 - khong doc duoc exFAT.";
+  const char* t6 = "Format lai bang Windows (MBR), khong dung GPT.";
+  const char* t7 = "Hoac cam lai the / thu the khac.";
+  const char* t8 = "Giu nut BOOT: bat/tat den nen.";
+  tft.setCursor((SCR_W - 6 * (int)strlen(t5)) / 2, 168);
+  tft.print(t5);
+  tft.setCursor((SCR_W - 6 * (int)strlen(t6)) / 2, 182);
+  tft.print(t6);
+  tft.setCursor((SCR_W - 6 * (int)strlen(t7)) / 2, 196);
+  tft.print(t7);
+  tft.setCursor((SCR_W - 6 * (int)strlen(t8)) / 2, 216);
+  tft.print(t8);
+}
+
+// Vao day khi mount that bai; chi return khi da mount duoc -> flow boot tiep tuc
+// binh thuong (jingle, startup screen, scanSD...).
+static void sdWaitUntilMounted() {
+  int attempts = 1;
+  unsigned long lastTry = millis();
+  drawSdWaitScreen(attempts);
+  for (;;) {
+    pollBootButton();
+    int16_t tx, ty;
+    bool tapped = displayBacklightOn && getTouchXY(tx, ty);
+    bool autoDue = (millis() - lastTry) > 5000UL;
+    if ((tapped && (millis() - lastTry) > 800UL) || autoDue) {
+      lastTry = millis();
+      attempts++;
+      if (sdMountSmart()) {
+        tft.fillScreen(COL_BG);
+        tft.setTextSize(2);
+        tft.setTextColor(TFT_GREEN, COL_BG);
+        const char* ok = "SD OK";
+        tft.setCursor((SCR_W - 12 * (int)strlen(ok)) / 2, 108);
+        tft.print(ok);
+        char f[40];
+        snprintf(f, sizeof(f), "mount lai lan %d", attempts);
+        tft.setTextSize(1);
+        tft.setTextColor(colInfoCyan(), COL_BG);
+        tft.setCursor((SCR_W - 6 * (int)strlen(f)) / 2, 140);
+        tft.print(f);
+        delay(800);
+        return;
+      }
+      drawSdWaitScreen(attempts);
+    }
+    delay(40);
+  }
+}
+
 static void runSdModeSetup() {
   // SD mode always boots at its default volume (9, Phúc 12/9), never the
   // BT 100%.
@@ -3099,21 +3915,22 @@ static void runSdModeSetup() {
   btSink.set_avrc_connection_state_callback(btAvrcConnCb);
   btSink.set_stream_reader(btDataCb, false);
   btSink.set_raw_stream_reader(btRawCb);     // SPEED measurement (decoded PCM)
+  btSink.set_sample_rate_callback(btSampleRateCb);   // 44.1k phones / 48k Linux
 
   // dedicated BT->I2S writer on core 0 (proven drop-free in the standalone
   // test): keeps the BT stream fed regardless of what core 1 is doing
-  xTaskCreatePinnedToCore(btAudioTask, "btAudio", 4096, nullptr, 8, nullptr, 0);
+  xTaskCreatePinnedToCore(btAudioTask, "btAudio", 6144, nullptr, 8, nullptr, 0);
   applyVolumePercent();
 
   // SD must be mounted before the startup chime: /sounds/boot.wav is the
   // preferred source, the built-in procedural chime is the fallback.
-  if (!SD.begin(SD_CS)) {
-    tft.setTextColor(TFT_RED,COL_BG);
-    tft.setTextSize(2);
-    tft.setCursor(20,90);
-    tft.print("SD Failed!");
-    while (1) { delay(1000); pollBootButton(); }
+  // SD mount: thu lan luot nhieu muc toc do SPI; neu that bai thi hien man hinh
+  // chan doan + cho phep cham man hinh / tu dong thu lai (KHONG treo cung nhu ban cu).
+  if (!sdMountSmart()) {
+    sdWaitUntilMounted();
   }
+  Serial.printf("[SD] mount step=%d freq=%lu Hz\n", sdMountStep,
+                (unsigned long)(sdMountStep >= 0 ? SD_MOUNT_FREQS[sdMountStep] : 0));
   sdReady = true;                    // /sounds/*.wav may be used from here on
   playJingleBlocking(JINGLE_BOOT);   // startup chime (fixed 20% gain)
 
@@ -3194,6 +4011,12 @@ static void loopSdMode() {
   updateDisplayTimeout();
   updateWifiScanResult();
   updateWifiConnecting();
+  autoBrightTick();                       // LDR -> backlight (no-op when auto is off)
+  if (briUiDirty) {                       // repaint only the live % readout
+    briUiDirty = false;
+    if      (screenMode==SCREEN_SETTINGS) drawSetBrightPct();
+    else if (screenMode==SCREEN_BT)       drawBtBriPct();
+  }
 
   if (clockForceRedraw && screenMode==SCREEN_CLOCK) drawClockScreen();
 
