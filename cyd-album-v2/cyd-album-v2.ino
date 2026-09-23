@@ -1852,6 +1852,20 @@ static float    jCurSrc = 0.0f, jFrac = 0.0f;
 // it never touches the card - Bluedroid needs the heap far more than SD does.
 static bool sdReady = false;
 
+struct JActiveNoteState {
+  uint32_t startSamp;
+  uint32_t endSamp;
+  float phase;
+  float phaseStep;
+  float env;
+  float decay;
+  float attack;
+  float attackStep;
+  float amp;
+};
+static JActiveNoteState jActiveNotes[8];
+static int jActiveNoteCount = 0;
+
 // Source priority: /sounds/*.wav on SD (user can swap it any time) ->
 // PCM embedded in flash -> procedural chime.
 static void jingleStart(int idx) {
@@ -1869,24 +1883,49 @@ static void jingleStart(int idx) {
     jStep = (float)JINGLE_EMB_RATE / (float)JINGLE_RATE;
     jSrcLeft = JINGLE_EMB_LEN[idx];
     jSrcOk = jPullSrc(&jCurSrc);
+    return;
   }
+
+  // Pre-calculate synth state for ultra-fast, zero-underrun playback
+  jActiveNoteCount = J_NCOUNT[idx];
+  const JNote* notes = J_NOTES[idx];
+  float decayFactor = expf(-4.5f / (float)JINGLE_RATE);
+  uint32_t attackFrames = (uint32_t)(0.006f * (float)JINGLE_RATE);
+  if (attackFrames < 1) attackFrames = 1;
+  float attackStepVal = 1.0f / (float)attackFrames;
+  for (int k = 0; k < jActiveNoteCount; k++) {
+    jActiveNotes[k].startSamp = (uint32_t)((float)notes[k].startMs * 0.001f * (float)JINGLE_RATE);
+    jActiveNotes[k].endSamp = jActiveNotes[k].startSamp + (uint32_t)((float)notes[k].durMs * 0.001f * (float)JINGLE_RATE);
+    jActiveNotes[k].phase = 0.0f;
+    jActiveNotes[k].phaseStep = (float)notes[k].f / (float)JINGLE_RATE;
+    jActiveNotes[k].env = 1.0f;
+    jActiveNotes[k].decay = decayFactor;
+    jActiveNotes[k].attack = 0.0f;
+    jActiveNotes[k].attackStep = attackStepVal;
+    jActiveNotes[k].amp = (float)notes[k].amp * 0.01f;
+  }
+
   Serial.printf("[JN] play %s src=%s\n", JINGLE_WAV[idx],
                 jUseWav ? "sd-wav" : (jEmbMode ? "flash-pcm" : "synth"));
 }
 
 static float jProcSample(uint32_t i) {
-  const JNote* notes = J_NOTES[jCur];
-  int n = J_NCOUNT[jCur];
-  float t = (float)i * (1.0f / (float)JINGLE_RATE);
   float acc = 0.0f;
-  for (int k = 0; k < n; k++) {
-    float dt = t - notes[k].startMs * 0.001f;
-    if (dt < 0.0f || dt >= notes[k].durMs * 0.001f) continue;
-    float env = expf(-4.5f * dt);
-    if (dt < 0.006f) env *= dt / 0.006f;          // click-free attack
-    float ph = notes[k].f * dt;
-    float a = notes[k].amp * 0.01f;
-    acc += a * (jSine(ph) + 0.20f * jSine(ph * 2.0f) + 0.05f * jSine(ph * 3.0f)) * env;
+  uint32_t attackFrames = (uint32_t)(0.006f * (float)JINGLE_RATE);
+  for (int k = 0; k < jActiveNoteCount; k++) {
+    if (i < jActiveNotes[k].startSamp || i >= jActiveNotes[k].endSamp) continue;
+    float cur_env;
+    if (i - jActiveNotes[k].startSamp < attackFrames) {
+      jActiveNotes[k].attack += jActiveNotes[k].attackStep;
+      cur_env = jActiveNotes[k].attack * jActiveNotes[k].env;
+    } else {
+      cur_env = jActiveNotes[k].env;
+    }
+    jActiveNotes[k].env *= jActiveNotes[k].decay;
+    float ph = jActiveNotes[k].phase;
+    jActiveNotes[k].phase += jActiveNotes[k].phaseStep;
+    float harm = jSine(ph) + 0.20f * jSine(ph * 2.0f) + 0.05f * jSine(ph * 3.0f);
+    acc += jActiveNotes[k].amp * harm * cur_env;
   }
   return acc * 0.55f;    // headroom: overlapping notes must not clip
 }
@@ -1917,14 +1956,27 @@ static void playJingleBlocking(int idx) {
   audioOut->jingleMode = true;
   jingleStart(idx);
   int16_t fr[2];
+  fr[0] = fr[1] = 0;
+  for (int p = 0; p < 32; p++) audioOut->ConsumeSample(fr);
   uint32_t frames = 0;
   while (jNextOut()) {
-    int16_t s = (int16_t)(jOutSample * 32000.0f);
-    fr[0] = fr[1] = s;
+    int32_t raw_s = (int32_t)(jOutSample * 32000.0f);
+    if (raw_s > 32767) raw_s = 32767;
+    if (raw_s < -32767) raw_s = -32767;
+    fr[0] = fr[1] = (int16_t)raw_s;
     int tries = 0;
-    while (!audioOut->ConsumeSample(fr)) { delay(1); if (++tries > 500) break; }
+    while (!audioOut->ConsumeSample(fr)) {
+      if (++tries > 80) {
+        delay(1);
+        if (tries > 250) break;
+      } else {
+        taskYIELD();
+      }
+    }
     if (++frames > 400000UL) break;   // hard cap (~9 s): never hang the boot
   }
+  fr[0] = fr[1] = 0;
+  for (int p = 0; p < 32; p++) audioOut->ConsumeSample(fr);
   audioOut->jingleMode = false;
   jWavStop();
   pumpSilence(96);
@@ -1955,12 +2007,25 @@ static void playJingleTask(int idx) {
   audioOut->jingleMode = true;
   jingleStart(idx);
   int16_t fr[2];
+  fr[0] = fr[1] = 0;
+  for (int p = 0; p < 32; p++) audioOut->ConsumeSample(fr);
   while (jNextOut()) {
-    int16_t s = (int16_t)(jOutSample * 32000.0f);
-    fr[0] = fr[1] = s;
+    int32_t raw_s = (int32_t)(jOutSample * 32000.0f);
+    if (raw_s > 32767) raw_s = 32767;
+    if (raw_s < -32767) raw_s = -32767;
+    fr[0] = fr[1] = (int16_t)raw_s;
     int tries = 0;
-    while (!audioOut->ConsumeSample(fr)) { vTaskDelay(1); if (++tries > 500) break; }
+    while (!audioOut->ConsumeSample(fr)) {
+      if (++tries > 80) {
+        vTaskDelay(1);
+        if (tries > 250) break;
+      } else {
+        taskYIELD();
+      }
+    }
   }
+  fr[0] = fr[1] = 0;
+  for (int p = 0; p < 32; p++) audioOut->ConsumeSample(fr);
   audioOut->jingleMode = false;
   jWavStop();
   pumpSilence(96);
